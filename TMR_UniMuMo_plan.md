@@ -27,7 +27,7 @@
 - **Three parts in `full.ckpt`** ([unimumo/models/unimumo.py](unimumo/models/unimumo.py)):
   - an Encodec 32 kHz **mono** music tokenizer (4 codebooks × 2048 entries, 50 Hz), frozen;
   - a motion VQ-VAE that maps 263-d HumanML3D-format features at **60 fps** into the *same* Encodec codebook at 50 Hz ([configs/train_motion_vqvae.yaml](configs/train_motion_vqvae.yaml)). Its encoder and decoder also take the music embedding ([unimumo/models/motion_vqvae.py:111](unimumo/models/motion_vqvae.py:111));
-  - the music–motion LM `MusicMotionTransformer`. It uses the MusicGen-small backbone (24 layers, d=1024) plus motion embeddings, a motion FFN per layer and motion heads. By my count of the module shapes that is about 0.5B parameters. Text enters through cross-attention to a frozen T5-base encoder, with separate music and motion prompts split by `<separation>`.
+  - the music–motion LM `MusicMotionTransformer`. It uses the MusicGen-small backbone (24 layers, d=1024) plus motion embeddings, a motion FFN per layer and motion heads. Measured with `cl/check_setup.py`: 848.9M LM parameters in total, of which 637.8M are trained in a session (≈420M backbone + 218.2M motion-specific). The rest are the caption-stage self-attention (100.7M) and the T5 conditioner (110.4M); the captioner decoder adds 223.7M. Text enters through cross-attention to a frozen T5-base encoder, with separate music and motion prompts split by `<separation>`.
   - a captioner: a T5-base decoder that reads LM features through an extra `captioning_self_attn` in every layer ([transformer.py:554](unimumo/audio/audiocraft_/modules/transformer.py:554)).
 - **One training task.** The LM does joint next-token prediction of both token streams over 10 s windows, with loss = 0.85·CE_music + 0.15·CE_motion ([transformer_model.py:229](unimumo/models/transformer_model.py:229), [configs/train_music_motion.yaml](configs/train_music_motion.yaml)). Attention is causal both within and across the two streams ([mm_lm.py:331](unimumo/audio/audiocraft_/models/mm_lm.py:331)). Music→dance at test time therefore just teacher-forces the music stream.
 - Pretraining used 48 GPUs (6 × 8 nodes). You never repeat it.
@@ -129,11 +129,13 @@ A foundation model's Session 0 must be something replay methods can replay. With
   - Metrics: **FID_k** (primary, m_{i,t}), FID_g, Div_k and BAS, computed on 22 joints at 60 fps.
   - Run ground truth and generated motion through the **same** 263-d → joints path (`recover_from_ric`). The Bailando/EDGE feature code assumes the SMPL-24 layout, so either duplicate the wrists for the hand joints or adapt it, but do the same for both sides.
   - Fix the reference set per group (all of the group's ground-truth windows) and use it for every method.
-- The AIST++ music→dance probe, with the authors' script [test_model/test_music2motion_aist.py](test_model/test_music2motion_aist.py). It uses EDGE-style sliced test music, genre text and guidance 3.0. Report FID_k, FID_g and BAS. **At S0 these must match the UniMuMo paper.**
+- The AIST++ music→dance probe, with the authors' script [test_model/test_music2motion_aist.py](test_model/test_music2motion_aist.py). It uses EDGE-style sliced test music, genre text and guidance 3.0. Report FID_k, FID_g, Div_k, Div_g and BAS. **At S0, Div_k, Div_g and BAS must match the UniMuMo paper.** It reports 10.68 / 10.35 / 0.24 for music-conditioned generation, against 10.61 / 7.48 / 0.24 for real dance. The paper deliberately reports no FID_k/FID_g, because the authors consider them unreliable for dance, so for FID there is no published number to match.
 
 **At S0 and after the last session only** (generating 10 s music is costly):
 - Text→music on MusicCaps with [test_model/test_musiccaps.py](test_model/test_musiccaps.py): FAD (VGGish), KL (PaSST) and CLAP, on the same caption subset for every method.
-- Captioning with [test_music2text_mullama.py](test_model/test_music2text_mullama.py) and [test_motion2text_pad.py](test_model/test_motion2text_pad.py): BLEU-4, METEOR, CIDEr and BERTScore, on fixed subsets.
+- Music captioning with [test_music2text_mullama.py](test_model/test_music2text_mullama.py) on MusicQA's 552 test pairs (the paper's protocol): BLEU, METEOR, ROUGE-L and BERTScore. The paper reports 0.261 / 0.291 / 0.369 / 0.892.
+- Motion captioning with [test_motion2text_pad.py](test_model/test_motion2text_pad.py) is optional. The authors' `motion_data.tar.gz` has no `test/` split, so HumanML3D test motions would have to be rebuilt from the official release.
+- The paper's text→music numbers to match at S0 are FAD_VGG 5.93, KL 1.99 and CLAP 0.27, computed with the AudioLDM eval repo.
 - Optional: motion→music with [test_motion2music_aist.py](test_model/test_motion2music_aist.py).
 
 **Report:**
@@ -187,7 +189,7 @@ def audio_trajectory(lm, music_codes, null_cond, layer=12, pool=2):
 **Must run** (same budget, steps and schedule for all):
 - **Vanilla FT.**
 - **Joint:** fine-tune θ0 on D0 ∪ D1…D4 for the same total number of steps. This is the upper bound and the "lossless" reference.
-- **Replay:** ER, MIR, GCR, CSReL and OCS, your strongest non-TMR methods in Tables 1–3. On a 0.5B model, give the gradient-based selectors last-layer (head) gradients, and say so.
+- **Replay:** ER, MIR, GCR, CSReL and OCS, your strongest non-TMR methods in Tables 1–3. On a model with 0.64B trainable parameters, give the gradient-based selectors last-layer (head) gradients, and say so.
 - **Regularization:** EWC, with a diagonal Fisher computed on D0 and past buffers.
 - **Methods specific to foundation models:**
   - LoRA fine-tuning (rank 16 on attention and both FFNs, lr 1e-4);
@@ -201,7 +203,7 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 
 ## 7. Pilot gates (run before the full grid)
 
-- **G1. Reproduce S0.** AIST++ music→dance with the authors' script must match the UniMuMo paper within noise. Fix the metric pipeline before doing anything else.
+- **G1. Reproduce S0.** AIST++ music→dance with the authors' script must match the UniMuMo paper within noise: Div_k ≈ 10.68, Div_g ≈ 10.35 and BAS ≈ 0.24, using Bailando's diversity code and Librosa beats for BAS. Fix the metric pipeline before doing anything else. Record S0's FID_k and FID_g as well; they have no published reference but are the starting point for measuring forgetting.
 - **G2. Tokenizer ceiling.** For each FineDance group, measure FID_k and MPJPE of decode(encode(ground truth)) against the ground truth. If a group's ceiling is far worse than AIST++'s, merge or drop that group. Never retrain the tokenizer partway through the sequence.
 - **G3. Does forgetting happen?** Run Vanilla S1→S2. You need a clear rise in S1's FID_k and in the AIST++ probe. Pretrained models often forget less. If the rise is small, either:
   - use more contrasting sessions;
@@ -216,13 +218,13 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 2. **Table, retention of pretrained capabilities after S4:** AIST++ FID_k and BAS, MusicCaps FAD and CLAP, captioning CIDEr. One row per method; the S0 row is the reference.
 3. **Figure, Session-0 retention against |B0|:** how many pretraining windows each method needs. This is the foundation-model version of your Fig. 2.
 4. **Figure, φ-layer ablation** (F_avg and coverage against ℓ), plus the C_k spectrum and the selected M_k for each session. It tests whether the effective rank grows with sessions, as your §5 claims.
-5. **Theory check (cheap and strong):** for every method's buffer, compute ε_B from Proposition 1 using TMR's φ. Plot it against measured forgetting across methods and seeds, and report Spearman ρ. This tests Proposition 1 directly on a 0.5B pretrained model.
-6. **Overhead table:** add the time and VRAM to build each buffer on the 0.5B model.
+5. **Theory check (cheap and strong):** for every method's buffer, compute ε_B from Proposition 1 using TMR's φ. Plot it against measured forgetting across methods and seeds, and report Spearman ρ. This tests Proposition 1 directly on a pretrained model with 0.64B trainable parameters.
+6. **Overhead table:** add the time and VRAM to build each buffer on UniMuMo.
 
 **Text changes:**
 - Add the fourth family to the abstract, §1 and §4 ("…diffusion-based motion generators, and a pretrained text–music–motion foundation model").
 - Describe S0 as the released checkpoint.
-- State the scale (about a 0.5B LM on a MusicGen-small backbone) so "foundation model" is not overclaimed.
+- State the scale (an 849M-parameter LM on a MusicGen-small backbone, 638M trained per session) so "foundation model" is not overclaimed.
 
 ## 9. Implementation checklist (new `cl/` folder)
 
@@ -258,6 +260,7 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 | A pretrained model forgets too little | Gate G3. Use more contrasting order or longer sessions. If forgetting stays small, report it honestly; that is a finding too |
 | The tokenizer cannot represent new genres | Gate G2. Add the ceiling as a row in the tables |
 | Noisy FID_k on small test sets | Use 5 s slices with a hop, 2 samples per slice and 3 seeds; report std; add FID_g and BAS |
+| UniMuMo's authors call FID_k/FID_g unreliable for dance | Use FID only as a relative measure (each method against itself at S0, same reference set). Report Div and BAS next to it, and say so in the paper before a reviewer does |
 | The 0.85 music loss weight dominates | Gate G4 |
 | Licences | Music4All on request; FineDance research licence (public part only); AIST++ CC BY 4.0; HumanML3D/AMASS non-commercial. Research use only; do not redistribute converted data |
 
