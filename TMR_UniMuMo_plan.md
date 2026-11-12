@@ -203,6 +203,13 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 
 ## 7. Pilot gates (run before the full grid)
 
+- **G0. Does the model use the audio? (decisive for UniMuMo)**
+  - **Measure:** audio reliance Δ_audio = CE_motion(music shuffled across windows) − CE_motion(matched music), with `cl/eval_nll.py --shuffle_music`.
+  - **S0 result on AIST++ val (152 windows): Δ_audio ≈ 0.0002 nats** (3.2926 against 3.2924). Teacher-forced, pretrained UniMuMo predicts dance from the dance history alone. A likely cause is that its pretraining pairs were random tracks with only the beats DTW-aligned.
+  - **Test:** fine-tune briefly on real AIST++ train pairs, then re-measure Δ_audio on AIST++ val.
+    - **If Δ_audio becomes clearly positive** (paired over windows, well above its SEM), real-pair sessions teach an audio–motion relationship. UniMuMo is then a valid TMR test bed. Report Δ_audio for every session and method: shrinkage of Δ_audio on old sessions is forgetting of the audio–motion relationship itself, which is a sharper and more TMR-specific number than CE.
+    - **If it stays ≈ 0**, forgetting in UniMuMo would be about the motion prior, not the audio pathway. Either present UniMuMo as a boundary case where TMR's assumption fails, or drop it.
+
 - **G1. Reproduce S0.** AIST++ music→dance with the authors' script must match the UniMuMo paper within noise: Div_k ≈ 10.68, Div_g ≈ 10.35 and BAS ≈ 0.24, using Bailando's diversity code and Librosa beats for BAS. Fix the metric pipeline before doing anything else. Record S0's FID_k and FID_g as well; they have no published reference but are the starting point for measuring forgetting.
 - **G2. Tokenizer ceiling.** For each FineDance group, measure FID_k and MPJPE of decode(encode(ground truth)) against the ground truth. If a group's ceiling is far worse than AIST++'s, merge or drop that group. Never retrain the tokenizer partway through the sequence.
 - **G3. Does forgetting happen?** Run Vanilla S1→S2. You need a clear rise in S1's FID_k and in the AIST++ probe. Pretrained models often forget less. If the rise is small, either:

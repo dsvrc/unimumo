@@ -21,6 +21,7 @@ Examples (run from the repo root):
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from os.path import join as pjoin
@@ -41,11 +42,32 @@ def read_manifest(path):
         return [json.loads(l) for l in f if l.strip()]
 
 
-def aist_manifest(split_file, motion_dir, wav_dir):
+def aist_music_id(seq):
+    """gBR_sBM_cAll_d04_mBR0_ch01 -> mBR0 (AIST++ has 60 tracks, 6 per genre)."""
+    m = re.search(r'_(m[A-Z]{2}\d)_', seq)
+    return m.group(1) if m else None
+
+
+def parse_music_filter(spec):
+    """'heldout0' -> the 10 tracks m??0 (one per genre); otherwise a comma list like 'mBR0,mPO1'."""
+    if not spec:
+        return None
+    if spec == 'heldout0':
+        return {f'm{g}0' for g in ['BR', 'PO', 'LO', 'MH', 'LH', 'HO', 'WA', 'KR', 'JS', 'JB']}
+    return set(spec.split(','))
+
+
+def aist_manifest(split_file, motion_dir, wav_dir, include_music=None, exclude_music=None):
     items, no_motion, no_wav = [], [], []
+    include, exclude = parse_music_filter(include_music), parse_music_filter(exclude_music)
+    n_filtered = 0
     with open(split_file) as f:
         for seq in (l.strip() for l in f):
             if not seq:
+                continue
+            mid = aist_music_id(seq)
+            if (include is not None and mid not in include) or (exclude is not None and mid in exclude):
+                n_filtered += 1
                 continue
             m, w = pjoin(motion_dir, seq + '.npy'), pjoin(wav_dir, seq + '.wav')
             if not os.path.exists(m):
@@ -55,7 +77,7 @@ def aist_manifest(split_file, motion_dir, wav_dir):
             if os.path.exists(m) and os.path.exists(w):
                 items.append({'id': seq, 'music': w, 'motion': m})
     print(f'AIST++ manifest from {split_file}: {len(items)} pairs; '
-          f'{len(no_motion)} missing motion, {len(no_wav)} missing wav')
+          f'{len(no_motion)} missing motion, {len(no_wav)} missing wav, {n_filtered} removed by music filter')
     for name, miss in [('motion', no_motion), ('wav', no_wav)]:
         if miss:
             print(f'  e.g. missing {name}: {miss[:3]}')
@@ -96,6 +118,14 @@ def tokenize_set(model, items, window, hop, batch_size):
         motion_codes.append(c_mo[..., :t])
     return {'ids': ids, 'music_code': torch.cat(music_codes), 'motion_code': torch.cat(motion_codes),
             'window': window, 'hop': hop}
+
+
+def shuffle_music(cache, seed=0):
+    """Control: pair every motion window with music from a different window (no fixed points)."""
+    g = torch.Generator().manual_seed(seed)
+    n = cache['music_code'].shape[0]
+    perm = (torch.arange(n) + torch.randint(1, n, (1,), generator=g)) % n
+    return dict(cache, music_code=cache['music_code'][perm])
 
 
 def load_lm_state(model, path):
@@ -146,6 +176,8 @@ if __name__ == '__main__':
     ap.add_argument('--aist_motions', default='data/motion/val/joint_vecs')
     ap.add_argument('--aist_wavs', default='../EDGE/edge_aistpp/wavs')
     ap.add_argument('--aist_name', default='aist_val')
+    ap.add_argument('--aist_music_include', default=None, help="'heldout0' or comma list of track ids")
+    ap.add_argument('--aist_music_exclude', default=None, help="'heldout0' or comma list of track ids")
     ap.add_argument('--window', type=float, default=5.0)
     ap.add_argument('--hop', type=float, default=5.0)
     ap.add_argument('--batch_size', type=int, default=16)
@@ -158,7 +190,8 @@ if __name__ == '__main__':
 
     sets = {}
     if args.aist_split:
-        sets[args.aist_name] = lambda: aist_manifest(args.aist_split, args.aist_motions, args.aist_wavs)
+        sets[args.aist_name] = lambda: aist_manifest(args.aist_split, args.aist_motions, args.aist_wavs,
+                                                     args.aist_music_include, args.aist_music_exclude)
     for spec in args.manifest:
         name, path = spec.split('=', 1)
         sets[name] = (lambda p=path: read_manifest(p))
@@ -184,11 +217,7 @@ if __name__ == '__main__':
             cache = tokenize_set(model, get_items(), args.window, args.hop, args.batch_size)
             torch.save(cache, cache_path)
         if args.shuffle_music:
-            # control: pair every motion window with music from a different window
-            g = torch.Generator().manual_seed(0)
-            n = cache['music_code'].shape[0]
-            perm = (torch.arange(n) + torch.randint(1, n, (1,), generator=g)) % n   # no fixed points
-            cache = dict(cache, music_code=cache['music_code'][perm])
+            cache = shuffle_music(cache)
             print(f'[{name}] CONTROL: music shuffled across windows')
         t0 = time.time()
         summary, per_window = eval_set(mm, cache, args.batch_size, args.bf16)
