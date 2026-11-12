@@ -42,17 +42,25 @@ def read_manifest(path):
 
 
 def aist_manifest(split_file, motion_dir, wav_dir):
-    items, missing = [], 0
+    items, no_motion, no_wav = [], [], []
     with open(split_file) as f:
         for seq in (l.strip() for l in f):
             if not seq:
                 continue
             m, w = pjoin(motion_dir, seq + '.npy'), pjoin(wav_dir, seq + '.wav')
+            if not os.path.exists(m):
+                no_motion.append(m)
+            if not os.path.exists(w):
+                no_wav.append(w)
             if os.path.exists(m) and os.path.exists(w):
                 items.append({'id': seq, 'music': w, 'motion': m})
-            else:
-                missing += 1
-    print(f'AIST++ manifest from {split_file}: {len(items)} pairs, {missing} skipped (missing motion or wav)')
+    print(f'AIST++ manifest from {split_file}: {len(items)} pairs; '
+          f'{len(no_motion)} missing motion, {len(no_wav)} missing wav')
+    for name, miss in [('motion', no_motion), ('wav', no_wav)]:
+        if miss:
+            print(f'  e.g. missing {name}: {miss[:3]}')
+    if not items:
+        sys.exit('No pairs found: fix --aist_motions / --aist_wavs (see the missing paths above).')
     return items
 
 
@@ -74,6 +82,8 @@ def tokenize_set(model, items, window, hop, batch_size):
             ids.append(f"{it['id']}@{start:.1f}")
             start += hop
     print(f'  {len(items)} pairs -> {len(ids)} windows of {window}s (hop {hop}s)')
+    if not ids:
+        sys.exit(f'No {window}s windows: every pair is shorter than the window (try --window 2.5).')
 
     music_codes, motion_codes = [], []
     for i in range(0, len(ids), batch_size):
@@ -141,6 +151,8 @@ if __name__ == '__main__':
     ap.add_argument('--batch_size', type=int, default=16)
     ap.add_argument('--cache_dir', default='outputs/token_cache')
     ap.add_argument('--bf16', action='store_true')
+    ap.add_argument('--shuffle_music', action='store_true',
+                    help='control: mismatched music; motion CE should rise if the model uses the audio')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
 
@@ -160,6 +172,7 @@ if __name__ == '__main__':
     mm.eval()
 
     os.makedirs(args.cache_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     results = {}
     for name, get_items in sets.items():
         cache_path = pjoin(args.cache_dir, f'{name}_w{args.window:g}_h{args.hop:g}.pt')
@@ -170,6 +183,13 @@ if __name__ == '__main__':
             print(f'[{name}] tokenizing...')
             cache = tokenize_set(model, get_items(), args.window, args.hop, args.batch_size)
             torch.save(cache, cache_path)
+        if args.shuffle_music:
+            # control: pair every motion window with music from a different window
+            g = torch.Generator().manual_seed(0)
+            n = cache['music_code'].shape[0]
+            perm = (torch.arange(n) + torch.randint(1, n, (1,), generator=g)) % n   # no fixed points
+            cache = dict(cache, music_code=cache['music_code'][perm])
+            print(f'[{name}] CONTROL: music shuffled across windows')
         t0 = time.time()
         summary, per_window = eval_set(mm, cache, args.batch_size, args.bf16)
         summary['seconds'] = round(time.time() - t0, 1)
@@ -180,7 +200,7 @@ if __name__ == '__main__':
 
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     meta = {'ckpt': args.ckpt, 'lm_state': args.lm_state, 'window': args.window, 'hop': args.hop,
-            'text': 'null', 'bf16': args.bf16}
+            'text': 'null', 'bf16': args.bf16, 'shuffle_music': args.shuffle_music}
     with open(args.out, 'w') as f:
         json.dump({'meta': meta, 'results': results}, f, indent=2)
     print(f'wrote {args.out}')
