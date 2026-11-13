@@ -1,5 +1,8 @@
 """StyleRetention of UniMuMo's generated dance (the DiscoForcing CL metric), per session test set.
 
+For the paper evaluation use cl/eval_dance.py (StyleRetention + FID_k, FID_g, Div, BAS, FSR with noise floors and
+the forgetting decision); this file provides the StyleEncoder it uses and a quick StyleRetention-only check.
+
 For every test song: the first --clips_per_song music clips of --clip_seconds are danced by the model
 (music -> motion, null text), the 60 fps joints are downsampled to 30 fps, cut into 5 s windows (1 s stride)
 and classified by the frozen FineDance style encoder trained in DiscoForcing

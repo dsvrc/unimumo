@@ -2,19 +2,18 @@
 # Establish forgetting with plain fine-tuning: S0 (pretrained) -> S1 Street -> S2 Folk (DiscoForcing order).
 # Run from the repo root on a GPU node:
 #   mkdir -p logs && bash cl/run_vanilla.sh > logs/run_vanilla.log 2>&1 &
-# A step is skipped when its output already exists, so rerunning only does what is missing (for example the
-# StyleRetention part once the style encoder is at $ENCODER). If a step crashes, delete its output first.
+# A step is skipped when its output already exists, so rerunning only does what is missing. If a step crashes,
+# delete its output first. Dance metrics and the forgetting decision come next, from cl/run_eval_dance.sh.
 #
 # Session length: S1 trains up to 1000 steps and keeps the step with the lowest S1 validation loss. Every
 # later session gets the same number of passes (epochs) over its own windows, with the same warm-up in
-# epochs (--schedule_from), so a small session (Folk is ~1/3 of Street) is not over-trained.
+# epochs (--schedule_from), so a smaller session (Folk has 58% of Street's windows) is not over-trained.
 set -euo pipefail
 
 M=data/finedance/manifests
 C=outputs/token_cache
 R=runs/fd
-ENCODER=${ENCODER:-pretrained/style_encoder_finedance.pt}
-mkdir -p outputs/nll outputs/style logs $R
+mkdir -p outputs/nll logs $R
 
 run() {  # run <output> <log> <command ...> : run the command unless <output> already exists
   local out=$1 log=$2; shift 2
@@ -57,30 +56,5 @@ fi
 python cl/forgetting_table.py --s0 outputs/nll/fd_s0.json \
   --method vanilla=outputs/nll/fd_after_s1.json,outputs/nll/fd_vanilla_after_s2.json $EXTRA
 
-if [ -f "$ENCODER" ]; then
-  echo "[5/5] StyleRetention of generated dance: reference rows, S0, after S1, after S2"
-  ST="--encoder $ENCODER --manifest s1_test=$M/s1_street_test.jsonl --manifest s2_test=$M/s2_folk_test.jsonl"
-  ST="$ST --manifest s3_test=$M/s3_classic_test.jsonl"
-  run outputs/style/fd_reference.json logs/fd_style_ref.log \
-    python cl/eval_style.py $ST --gt --recon --no_gen --out outputs/style/fd_reference.json
-  run outputs/style/fd_s0.json logs/fd_style_s0.log \
-    python cl/eval_style.py $ST --out outputs/style/fd_s0.json
-  run outputs/style/fd_after_s1.json logs/fd_style_s1.log \
-    python cl/eval_style.py $ST --lm_state $R/s1/lm.pt --out outputs/style/fd_after_s1.json
-  run outputs/style/fd_vanilla_after_s2.json logs/fd_style_s2.log \
-    python cl/eval_style.py $ST --lm_state $R/vanilla/s2/lm.pt --out outputs/style/fd_vanilla_after_s2.json
-  EXTRA=""
-  if [ -f $R/vanilla_500steps/s2/lm.pt ]; then
-    run outputs/style/fd_vanilla500_after_s2.json logs/fd_style_s2_500steps.log \
-      python cl/eval_style.py $ST --lm_state $R/vanilla_500steps/s2/lm.pt --out outputs/style/fd_vanilla500_after_s2.json
-    EXTRA="--method vanilla_500steps=outputs/style/fd_after_s1.json,outputs/style/fd_vanilla500_after_s2.json"
-  fi
-  python cl/forgetting_table.py --key StyleRetention --higher_is_better --s0 outputs/style/fd_s0.json \
-    --method vanilla=outputs/style/fd_after_s1.json,outputs/style/fd_vanilla_after_s2.json $EXTRA
-  for f in ref s0 s1 s2 s2_500steps; do
-    if [ -f logs/fd_style_$f.log ]; then echo "--- $f"; grep "StyleRetention" logs/fd_style_$f.log || true; fi
-  done
-else
-  echo "[5/5] skipped StyleRetention: no style encoder at $ENCODER"
-fi
+echo "[5/5] dance metrics (StyleRetention, FID_k, FID_g, ...) and the forgetting decision: bash cl/run_eval_dance.sh"
 echo "done"
