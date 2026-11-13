@@ -1,5 +1,18 @@
 # Adding UniMuMo to the TMR benchmark: data, sessions, protocol
 
+> **Protocol as decided (supersedes the Session-0 parts below):**
+> - **Session 0** is the pretrained UniMuMo as downloaded. No training, and it is not an evaluation target.
+> - **Three fine-tuning sessions** (decided):
+>   - **S1 = Street:** close to what UniMuMo already knows.
+>   - **S2 = Chinese classical:** the largest jump in both movement and music.
+>   - **S3 = Folk/ethnic.**
+>   - After S2 we measure forgetting of S1; after S3, forgetting of S1 and S2. F_avg and A_avg use the paper's formulas over the three sessions.
+>   - FineDance's modern/jazz/other songs are left out of the sequence. They can serve as a held-out appendix set.
+> - Forgetting is measured only on the fine-tuned sessions, as in the GestureLSM, TalkSHOW and MOSPA tables.
+> - Replay buffers are built only from data of fine-tuned sessions. There is **no D0 replay pool**, so Music4All is not needed.
+> - The tests of pretrained skills (AIST++, MusicCaps, captioning) are at most an appendix extra.
+> - The rest of §§4.4–4.6 and §8 that concerns Session 0 is optional.
+
 **The short answer.** Start from the released UniMuMo checkpoint and treat it as Session 0. Build Sessions 1–4 from FineDance, grouped by coarse dance style. UniMuMo has never seen FineDance. Test each session on its held-out songs. Also measure the capabilities UniMuMo had before you touched it: AIST++ music→dance, text→music and captioning. Do not use AIST++ genres as sessions, because UniMuMo already trained on those motions. Give Session 0 a small replay pool built with UniMuMo's own pretraining recipe, so that replay methods can protect what was pretrained.
 
 ---
@@ -13,8 +26,8 @@
 | Session 0 | Released `full.ckpt`, no retraining |
 | Sessions 1–4 | FineDance coarse-style groups, ordered from closest to pretraining to furthest: Street → Chinese classical → Folk/ethnic → Modern/other |
 | Test data per session | FineDance@Genre test songs of that group, 5 s slices |
-| Probes of pretrained capability | AIST++ music→dance (authors' protocol), MusicCaps text→music, music and motion captioning |
-| Session-0 replay data | 2K 10-s windows built with UniMuMo's pretraining recipe; the 10% rule picks 200 |
+| Probes of pretrained capability | Optional appendix only (AIST++, MusicCaps, captioning) |
+| Session-0 replay data | None. Session 0 is just the starting weights; buffers come from fine-tuned sessions |
 | Conditioning in sessions | Audio only (null text), so the model gets no task identity; genre text is an ablation |
 | What is trained | The LM only. Encodec, the motion VQ-VAE, T5 and the captioner stay frozen |
 | TMR feature φ | Music-stream hidden state at LM layer 12 of 24, motion stream masked, pooled to 25 Hz (T=250, D=1024) |
