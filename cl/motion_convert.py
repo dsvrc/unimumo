@@ -204,10 +204,24 @@ def load_edge_skeleton(edge_root):
     return np.array(found['smpl_offsets'], dtype=np.float64), list(found['smpl_parents'])
 
 
-def edge_pkl_to_joints(pkl_path, offsets, parents, src_fps=60, dst_fps=60):
+def load_aist_pkl(pkl_path):
+    """AIST++ SMPL at 60 fps -> (axis-angle (T, 24, 3), root position (T, 3) in SMPL units).
+    Accepts the original AIST++ keys (smpl_poses / smpl_trans / smpl_scaling) and EDGE's (q / pos / scale)."""
     m = pickle.load(open(pkl_path, 'rb'))
-    q = np.asarray(m['q'], dtype=np.float64).reshape(len(m['q']), -1, 3)       # (T, 24, 3) axis-angle
-    pos = np.asarray(m['pos'], dtype=np.float64) / np.asarray(m['scale']).reshape(-1)[0]
+    if 'smpl_poses' in m:
+        q, pos, scale = m['smpl_poses'], m['smpl_trans'], m['smpl_scaling']
+    elif 'q' in m:
+        q, pos, scale = m['q'], m['pos'], m['scale']
+    else:
+        raise KeyError(f'{pkl_path}: unknown AIST++ format, keys = {list(m.keys())}')
+    q = np.asarray(q, dtype=np.float64)
+    q = q.reshape(len(q), -1, 3)
+    pos = np.asarray(pos, dtype=np.float64) / float(np.asarray(scale).reshape(-1)[0])
+    return q, pos
+
+
+def edge_pkl_to_joints(pkl_path, offsets, parents, src_fps=60, dst_fps=60):
+    q, pos = load_aist_pkl(pkl_path)
     quats = axis_angle_to_quat(q)
     if src_fps != dst_fps:
         quats, pos = resample(quats, pos, src_fps, dst_fps)
@@ -318,9 +332,8 @@ def cmd_aist(args):
                     print(f'  mirror={str(mirror):5s} feet_thre={thre:<9g} shift={s:+d} {fmt(compare(ours, ref, s))}')
             if args.resample_check:
                 # 60 -> 30 -> 60 fps against the direct 60 fps conversion (estimates FineDance's resampling error)
-                m = pickle.load(open(pkl, 'rb'))
-                q = axis_angle_to_quat(np.asarray(m['q'], dtype=np.float64).reshape(len(m['q']), -1, 3))
-                pos = np.asarray(m['pos'], dtype=np.float64) / np.asarray(m['scale']).reshape(-1)[0]
+                q_aa, pos = load_aist_pkl(pkl)
+                q = axis_angle_to_quat(q_aa)
                 q30, p30 = q[::2], pos[::2]
                 q60, p60 = resample(q30, p30, 30, 60)
                 j60 = to_y_up(smpl_fk(q60, p60, offsets, parents)[:, :JOINTS_NUM])[0]

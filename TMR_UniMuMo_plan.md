@@ -219,6 +219,13 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 - **G0. Does the model use the audio? (decisive for UniMuMo)**
   - **Measure:** audio reliance Δ_audio = CE_motion(music shuffled across windows) − CE_motion(matched music), with `cl/eval_nll.py --shuffle_music`.
   - **S0 result on AIST++ val (152 windows): Δ_audio ≈ 0.0002 nats** (3.2926 against 3.2924). Teacher-forced, pretrained UniMuMo predicts dance from the dance history alone. A likely cause is that its pretraining pairs were random tracks with only the beats DTW-aligned.
+  - **S0 held-out motion CE (bf16, 5 s windows):**
+    - AIST++ val: 3.29 (152 windows);
+    - the val sequences on held-out tracks m??0: 3.04 (52 windows);
+    - the *train* sequences on those tracks: **1.88** (479 windows).
+
+    UniMuMo has memorized the AIST++ train motions it saw in pretraining. This confirms that AIST++ cannot be a session, and that only unseen motions (FineDance) give a real learning signal. Judge G0 on `heldout_val`.
+  - **Converter verified** (`cl/motion_convert.py selftest`): UniMuMo features → joints → features reproduces every channel exactly, on AIST++ at 60 fps and on HumanML3D at 20 fps. The foot-contact threshold is HumanML3D's default 0.002, even at 60 fps.
   - **Test:** fine-tune briefly on real AIST++ train pairs, then re-measure Δ_audio on AIST++ val.
     - **If Δ_audio becomes clearly positive** (paired over windows, well above its SEM), real-pair sessions teach an audio–motion relationship. UniMuMo is then a valid TMR test bed. Report Δ_audio for every session and method: shrinkage of Δ_audio on old sessions is forgetting of the audio–motion relationship itself, which is a sharper and more TMR-specific number than CE.
     - **If it stays ≈ 0**, forgetting in UniMuMo would be about the motion prior, not the audio pathway. Either present UniMuMo as a boundary case where TMR's assumption fails, or drop it.
