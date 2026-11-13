@@ -17,6 +17,9 @@ G0 pilot (real AIST++ pairs -> does the model start using the music?):
 Later sessions:
     --init_lm_state runs/<method>/s1/lm.pt     start from the previous session
     --replay buffer.pt                         token cache of replayed windows (optional 'weights')
+    --schedule_from runs/fd/s1                 same session length and warm-up as S1, counted in passes
+                                               (epochs) over this session's own windows, so a smaller
+                                               session is not trained for more epochs than S1 was
 """
 import argparse
 import json
@@ -90,6 +93,18 @@ def evaluate(mm, eval_caches, batch_size, use_bf16):
     return out
 
 
+def schedule_from(run_dir):
+    """Best length and warm-up of a finished --save_best run, in epochs over that run's training windows."""
+    a = json.load(open(pjoin(run_dir, 'args.json')))
+    b = json.load(open(pjoin(run_dir, 'best.json')))
+    assert b['step'] > 0, f'{run_dir}: the best step is 0 (the run never improved)'
+    n = b.get('n_train')
+    if n is None:  # runs from before n_train was recorded: count the windows in its token cache
+        n = torch.load(a['train_cache'] or pjoin(run_dir, 'train_tokens.pt'), weights_only=False)['music_code'].shape[0]
+    bs = a['batch_size']
+    return {'epochs': b['step'] * bs / n, 'warmup_epochs': a['warmup'] * bs / n, 'n_train': n, 'step': b['step']}
+
+
 def load_or_build_cache(model, path, items_fn, window, hop, batch_size):
     if path and os.path.exists(path):
         print(f'using token cache {path}')
@@ -125,9 +140,15 @@ if __name__ == '__main__':
     ap.add_argument('--eval_every', type=int, default=500)
     # optimisation
     ap.add_argument('--steps', type=int, default=2000)
+    ap.add_argument('--epochs', type=float, default=None,
+                    help='session length in passes over the training windows (overrides --steps)')
+    ap.add_argument('--schedule_from', default=None,
+                    help='run dir of a finished --save_best session (e.g. runs/fd/s1): take its best length and '
+                         'its warm-up in epochs (overrides --steps/--warmup unless --epochs/--warmup_epochs given)')
     ap.add_argument('--batch_size', type=int, default=16)
     ap.add_argument('--lr', type=float, default=1e-5)
     ap.add_argument('--warmup', type=int, default=200)
+    ap.add_argument('--warmup_epochs', type=float, default=None, help='warm-up in epochs (overrides --warmup)')
     ap.add_argument('--weight_decay', type=float, default=0.0)
     ap.add_argument('--motion_weight', type=float, default=0.15)
     ap.add_argument('--max_norm', type=float, default=1.0)
@@ -158,9 +179,25 @@ if __name__ == '__main__':
     else:
         assert args.train_manifest, 'give --train_aist_split or --train_manifest'
         items_fn = lambda: read_manifest(args.train_manifest)
-    train_cache = load_or_build_cache(model, args.train_cache or pjoin(args.run_dir, 'train_tokens.pt'),
-                                      items_fn, args.window, args.hop, args.batch_size)
-    print(f'train windows: {train_cache["music_code"].shape[0]}')
+    args.train_cache = args.train_cache or pjoin(args.run_dir, 'train_tokens.pt')
+    train_cache = load_or_build_cache(model, args.train_cache, items_fn, args.window, args.hop, args.batch_size)
+    n_train = train_cache['music_code'].shape[0]
+    if args.schedule_from:
+        ref = schedule_from(args.schedule_from)
+        print(f"schedule from {args.schedule_from}: best step {ref['step']} = {ref['epochs']:.2f} epochs over "
+              f"{ref['n_train']} windows, warm-up {ref['warmup_epochs']:.2f} epochs")
+        args.epochs = args.epochs if args.epochs is not None else ref['epochs']
+        args.warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else ref['warmup_epochs']
+    if args.epochs is not None:
+        args.steps = max(1, round(args.epochs * n_train / args.batch_size))
+    if args.warmup_epochs is not None:
+        args.warmup = max(1, round(args.warmup_epochs * n_train / args.batch_size))
+    args.n_train = n_train
+    with open(pjoin(args.run_dir, 'args.json'), 'w') as f:  # again, with the resolved steps / warm-up
+        json.dump(vars(args), f, indent=2)
+    ep = lambda step: step * args.batch_size / n_train
+    print(f'train windows: {n_train} | session: {args.steps} steps = {ep(args.steps):.2f} epochs, '
+          f'warm-up {args.warmup} steps = {ep(args.warmup):.2f} epochs')
     replay = []
     for p in args.replay:
         c = torch.load(p)
@@ -192,11 +229,11 @@ if __name__ == '__main__':
             return
         v = res[args.save_best]['motion_ce']
         if v < best['motion_ce']:
-            best.update(step=step, motion_ce=v)
+            best.update(step=step, motion_ce=v, epochs=ep(step))
             if step > 0:
                 torch.save(mm.state_dict(), pjoin(args.run_dir, 'lm.pt'))
             with open(pjoin(args.run_dir, 'best.json'), 'w') as f:
-                json.dump({'eval': args.save_best, **best}, f)
+                json.dump({'eval': args.save_best, 'n_train': n_train, 'batch_size': args.batch_size, **best}, f)
             print(f'  new best {args.save_best} motion CE {v:.4f} at step {step}' + (' (saved lm.pt)' if step else ''))
 
     if eval_caches:
@@ -233,9 +270,9 @@ if __name__ == '__main__':
                   f'gn {rec["grad_norm"]:.2f} | {(time.time() - t0) / step:.2f}s/step')
         if eval_caches and (step % args.eval_every == 0 or step == args.steps):
             res = evaluate(mm, eval_caches, args.batch_size, use_bf16)
-            write({'step': step, 'eval': res})
+            write({'step': step, 'epochs': ep(step), 'eval': res})
             for k, v in res.items():
-                print(f'[step {step}] {k}: motion CE {v["motion_ce"]:.4f} | '
+                print(f'[step {step}] ({ep(step):.2f} ep) {k}: motion CE {v["motion_ce"]:.4f} | '
                       f'd_audio {v["d_audio"]:+.4f} ± {v["d_audio_sem"]:.4f} (frac>0 {v["d_audio_frac_pos"]:.2f})')
             maybe_save_best(step, res)
 

@@ -132,9 +132,9 @@ A foundation model's Session 0 must be something replay methods can replay. With
 - **Objective:** UniMuMo's own loss, unchanged (0.85 / 0.15). This matches the paper's "default backbone configuration". If gate G4 shows weak plasticity, raise the motion weight to 0.5 **for all methods**.
 - **Optimizer:**
   - AdamW with β=(0.9, 0.95) and gradient clipping at 1.0.
-  - Learning rate: sweep {5e-6, 1e-5, 2e-5} **once**, with Vanilla on S1 validation, then freeze it. Use 500 warm-up steps, then a constant rate.
+  - Learning rate: sweep {5e-6, 1e-5, 2e-5} **once**, with Vanilla on S1 validation, then freeze it (S1 used 1e-5). Linear warm-up (200 steps in S1, the same number of epochs in later sessions), then a constant rate.
   - Weight decay 0.0–0.01. Pretraining's 0.1 pulls weights towards zero, which is drift that has nothing to do with the data.
-- **Steps and batches:** bf16 autocast, 16 windows per step (use gradient accumulation if needed). Use a fixed number of steps per session: run Vanilla on S1, evaluate the S1 **validation** songs every 100 steps, and take the step with the **lowest** validation motion CE. G0 showed held-out loss can rise within a few hundred steps while training loss keeps falling, so expect hundreds of steps, not thousands. Use identical steps, batch and schedule for every method.
+- **Steps and batches:** bf16 autocast, 16 windows per step (use gradient accumulation if needed). Session length is fixed in **epochs** (passes over the session's own training windows): run Vanilla on S1, evaluate the S1 **validation** songs every 100 steps, and take the step with the **lowest** validation motion CE. Every later session then gets the same number of epochs and the same warm-up in epochs (`train_session.py --schedule_from runs/fd/s1`). A fixed *step* count over-trains small sessions: Folk has about a third of Street's songs, so 500 steps were ~3× S1's epochs and Folk validation loss was already rising (see §7). Use the identical schedule, batch and steps per session for every method.
 - **Replay:** every step draws a replay batch of the same size from B_{<k}, sampling each item with probability proportional to w_i. Loss = L_new + λ·L_replay with λ = 1 (the paper's Eq. 7).
 - **Seeds:** 3 seeds for Vanilla, Joint, TMR and the two strongest baselines; 1 seed for the rest, and state that.
 
@@ -218,7 +218,7 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 
 ## 7. Pilot gates (run before the full grid)
 
-- **Decision (user):** G0 is **not a gate**. The protocol is S0 = checkpoint → S1 fine-tune → S2 fine-tune (forgetting of S1) → S3. d_audio is only *logged* during training, to help explain results. The one lesson kept from G0: fine-tuning can overfit, so **choose the steps per session as the step with the lowest S1 validation-song loss**, checked every 100 steps with Vanilla, and use that count for every session and method.
+- **Decision (user):** G0 is **not a gate**. The protocol is S0 = checkpoint → S1 fine-tune → S2 fine-tune (forgetting of S1) → S3. d_audio is only *logged* during training, to help explain results. The one lesson kept from G0: fine-tuning can overfit, so **choose the S1 length as the step with the lowest S1 validation-song loss**, checked every 100 steps with Vanilla, and give every later session and method the same number of **epochs** (not steps).
 - **Sessions built, first version (superseded by the DiscoForcing-aligned splits above; S1 is retrained under `runs/fd/`):**
   - S1 Street ≈ 2.65 h, S2 Classic ≈ 2.06 h, S3 Folk ≈ 1.49 h in total;
   - FineDance converted with SMPL-X neutral rest joints; the 6D convention is the pytorch3d "rows" one (knee check 1.000 against 0.000).
@@ -226,6 +226,14 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
   - S1 validation motion CE fell from 3.30 (pretrained) to **2.32 at step 300**, then overfit (3.19 by step 2000).
   - **Fixed session length = 300 steps** for every session and method. Vanilla, ER and TMR share this S1 checkpoint.
   - d_audio stayed ≈ 0 throughout (−0.0002 ± 0.0002 at the best step).
+- **Vanilla forgetting, DiscoForcing-aligned splits (`runs/fd`, `cl/run_vanilla.sh`, first run 2026-11-13). Forgetting is established in held-out CE:**
+  - S0 test motion CE: S1 Street 3.32, S2 Folk 2.49, S3 Classic 2.60.
+  - S1 Street: S1 val 3.16 → **2.174 best at step 500**, then overfits (2.30 at step 1000). S1 test 3.32 → 2.28.
+  - S2 Folk, Vanilla, 500 steps from S1: S1 test 2.28 → **2.57 (F = +0.29; 28% of S1's gain lost)**. During S2, S1 val rose steadily from 2.164 (step 50) to 2.438 (step 500).
+  - **But S2 was over-trained:** S2 val was best at **step 150 (2.030)** and climbed back to 2.137 by step 500. At step 150, S1 val had risen only +0.04 (2.174 → 2.215), so much of the +0.29 comes from training ~3× S1's epochs on the smaller Folk set. Fixed with the epoch-matched schedule (§4.5); the 500-step run is kept as `runs/fd/vanilla_500steps` as a "longer session → more forgetting" point.
+  - S2 test after S2 was 1.63 while S2 val was 2.14. Folk val is only ~2 songs, and test may be closer to the training songs; check per song (the `*_per_window.npz` files) before relying on S2 test numbers.
+  - d_audio ≤ 0.0024 at every evaluation: the model still ignores the music, so generated style = current motion prior.
+  - StyleRetention not run yet: the DiscoForcing encoder (`raw_data/cl_sessions/_style_encoder/finedance/encoder.pt`) is not on the cluster.
 - **G0. Does the model use the audio? (diagnostic only)**
   - **Measure:** audio reliance Δ_audio = CE_motion(music shuffled across windows) − CE_motion(matched music), with `cl/eval_nll.py --shuffle_music`.
   - **S0 result on AIST++ val (152 windows): Δ_audio ≈ 0.0002 nats** (3.2926 against 3.2924). Teacher-forced, pretrained UniMuMo predicts dance from the dance history alone. A likely cause is that its pretraining pairs were random tracks with only the beats DTW-aligned.
@@ -252,7 +260,7 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 
 - **G1. Reproduce S0.** AIST++ music→dance with the authors' script must match the UniMuMo paper within noise: Div_k ≈ 10.68, Div_g ≈ 10.35 and BAS ≈ 0.24, using Bailando's diversity code and Librosa beats for BAS. Fix the metric pipeline before doing anything else. Record S0's FID_k and FID_g as well; they have no published reference but are the starting point for measuring forgetting.
 - **G2. Tokenizer ceiling.** For each FineDance group, measure FID_k and MPJPE of decode(encode(ground truth)) against the ground truth. If a group's ceiling is far worse than AIST++'s, merge or drop that group. Never retrain the tokenizer partway through the sequence.
-- **G3. Does forgetting happen?** Run Vanilla S1→S2. You need a clear rise in S1's FID_k and in the AIST++ probe. Pretrained models often forget less. If the rise is small, either:
+- **G3. Does forgetting happen?** Run Vanilla S1→S2 (`cl/run_vanilla.sh`). You need a clear rise in S1's held-out CE and a clear drop in S1's StyleRetention. CE: yes (+0.29 at 500 S2 steps; rerun with the epoch-matched schedule). StyleRetention: pending the encoder. Pretrained models often forget less. If the rise is small, either:
   - use more contrasting sessions;
   - or run longer sessions.
   Decide this before running baselines.
