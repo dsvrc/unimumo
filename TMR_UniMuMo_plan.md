@@ -132,7 +132,7 @@ A foundation model's Session 0 must be something replay methods can replay. With
   - AdamW with β=(0.9, 0.95) and gradient clipping at 1.0.
   - Learning rate: sweep {5e-6, 1e-5, 2e-5} **once**, with Vanilla on S1 validation, then freeze it. Use 500 warm-up steps, then a constant rate.
   - Weight decay 0.0–0.01. Pretraining's 0.1 pulls weights towards zero, which is drift that has nothing to do with the data.
-- **Steps and batches:** bf16 autocast, 16 windows per step (use gradient accumulation if needed). Use a fixed number of steps per session: pick it where Vanilla's S1 validation motion CE plateaus, probably 4–8K. Use identical steps, batch and schedule for every method.
+- **Steps and batches:** bf16 autocast, 16 windows per step (use gradient accumulation if needed). Use a fixed number of steps per session: run Vanilla on S1, evaluate the S1 **validation** songs every 100 steps, and take the step with the **lowest** validation motion CE. G0 showed held-out loss can rise within a few hundred steps while training loss keeps falling, so expect hundreds of steps, not thousands. Use identical steps, batch and schedule for every method.
 - **Replay:** every step draws a replay batch of the same size from B_{<k}, sampling each item with probability proportional to w_i. Loss = L_new + λ·L_replay with λ = 1 (the paper's Eq. 7).
 - **Seeds:** 3 seeds for Vanilla, Joint, TMR and the two strongest baselines; 1 seed for the rest, and state that.
 
@@ -216,7 +216,8 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 
 ## 7. Pilot gates (run before the full grid)
 
-- **G0. Does the model use the audio? (decisive for UniMuMo)**
+- **Decision (user):** G0 is **not a gate**. The protocol is S0 = checkpoint → S1 fine-tune → S2 fine-tune (forgetting of S1) → S3. d_audio is only *logged* during training, to help explain results. The one lesson kept from G0: fine-tuning can overfit, so **choose the steps per session as the step with the lowest S1 validation-song loss**, checked every 100 steps with Vanilla, and use that count for every session and method.
+- **G0. Does the model use the audio? (diagnostic only)**
   - **Measure:** audio reliance Δ_audio = CE_motion(music shuffled across windows) − CE_motion(matched music), with `cl/eval_nll.py --shuffle_music`.
   - **S0 result on AIST++ val (152 windows): Δ_audio ≈ 0.0002 nats** (3.2926 against 3.2924). Teacher-forced, pretrained UniMuMo predicts dance from the dance history alone. A likely cause is that its pretraining pairs were random tracks with only the beats DTW-aligned.
   - **S0 held-out motion CE (bf16, 5 s windows):**
@@ -226,6 +227,16 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 
     UniMuMo has memorized the AIST++ train motions it saw in pretraining. This confirms that AIST++ cannot be a session, and that only unseen motions (FineDance) give a real learning signal. Judge G0 on `heldout_val`.
   - **Converter verified** (`cl/motion_convert.py selftest`): UniMuMo features → joints → features reproduces every channel exactly, on AIST++ at 60 fps and on HumanML3D at 20 fps. The foot-contact threshold is HumanML3D's default 0.002, even at 60 fps.
+  - **Full pipeline verified** (`cl/motion_convert.py aist`): AIST++ SMPL (EDGE's SMPL offsets, y-up, no mirror, threshold 0.002) → features matches UniMuMo's AIST++ features exactly on 5/5 sequences. The 60→30→60 fps round trip costs relative RMSE ≤ 0.002 on positions, ≤ 0.012 on rotations and ~0.11 on velocities, with 98–99% contact agreement. That velocity loss is inherent to 30 fps data such as FineDance.
+  - **G0 run 1 (`runs/g0_aist`): failed.** It trained on AIST++ train sequences without the held-out tracks, for 2000 steps at lr 1e-5 with the default 0.85/0.15 loss.
+    - d_audio stayed ≈ 0 on every held-out set at every evaluation (final `heldout_val` −0.004 ± 0.003).
+    - It overfit: training CE fell (motion ~0.9 → 0.56; music → 0.04, i.e. the 50 training songs were memorized) while held-out motion CE *rose* (`heldout_val` 3.04 → 4.09, `aist_val` 3.29 → 4.37).
+    - Caveats: those training motions were already memorized in pretraining, and the loss was 85% music.
+  - **G0 run 2 (fair retest):**
+    - Train on the **AIST++ test split**: 469 sequences whose motions UniMuMo never trained on, converted with the verified pipeline, minus the held-out tracks.
+    - Use a **motion-only loss** (`--motion_weight 1.0`) and evaluate every 100 steps on held-out tracks with unseen motions.
+    - Pass = held-out motion CE drops below step 0 (real plasticity) **and** d_audio becomes clearly positive.
+    - **If it fails too,** UniMuMo's motion stream does not use audio even when trained on real pairs. Then either report it as a boundary case, or switch to a pretrained model that verifiably uses audio.
   - **Test:** fine-tune briefly on real AIST++ train pairs, then re-measure Δ_audio on AIST++ val.
     - **If Δ_audio becomes clearly positive** (paired over windows, well above its SEM), real-pair sessions teach an audio–motion relationship. UniMuMo is then a valid TMR test bed. Report Δ_audio for every session and method: shrinkage of Δ_audio on old sessions is forgetting of the audio–motion relationship itself, which is a sharper and more TMR-specific number than CE.
     - **If it stays ≈ 0**, forgetting in UniMuMo would be about the motion prior, not the audio pathway. Either present UniMuMo as a boundary case where TMR's assumption fails, or drop it.

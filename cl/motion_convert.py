@@ -19,6 +19,7 @@ Self-checks, run from the repo root before converting any FineDance file:
 """
 import argparse
 import ast
+import glob
 import os
 import pickle
 import sys
@@ -228,6 +229,67 @@ def edge_pkl_to_joints(pkl_path, offsets, parents, src_fps=60, dst_fps=60):
     return smpl_fk(quats, pos, offsets, parents)[:, :JOINTS_NUM]
 
 
+# ------------------------------------------------------------------ FineDance (SMPL-X, 6D rotations, 30 fps)
+SMPL_BODY_PARENTS = [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19]
+
+
+def rot6d_to_matrix(d6):
+    """pytorch3d.rotation_6d_to_matrix in numpy: the 6D vector is the first two ROWS of R."""
+    a1, a2 = d6[..., :3], d6[..., 3:]
+    b1 = a1 / np.linalg.norm(a1, axis=-1, keepdims=True)
+    b2 = a2 - (b1 * a2).sum(-1, keepdims=True) * b1
+    b2 = b2 / np.linalg.norm(b2, axis=-1, keepdims=True)
+    b3 = np.cross(b1, b2)
+    return np.stack([b1, b2, b3], axis=-2)
+
+
+def matrix_to_quat(mats):
+    from scipy.spatial.transform import Rotation
+    shape = mats.shape[:-2]
+    q = Rotation.from_matrix(mats.reshape(-1, 3, 3)).as_quat()        # (x, y, z, w)
+    return q[:, [3, 0, 1, 2]].reshape(shape + (4,))                    # (w, x, y, z)
+
+
+def load_smplx_body_skeleton(npz_path):
+    """Rest-pose offsets of the 22 body joints of the neutral SMPL-X model (zero betas)."""
+    d = np.load(npz_path, allow_pickle=True)
+    J = np.asarray(d['J_regressor'], dtype=np.float64) @ np.asarray(d['v_template'], dtype=np.float64)
+    parents = np.asarray(d['kintree_table'][0]).astype(np.int64)[:JOINTS_NUM]
+    parents[0] = -1
+    assert list(parents) == SMPL_BODY_PARENTS, f'unexpected SMPL-X body tree: {list(parents)}'
+    offsets = np.zeros((JOINTS_NUM, 3))
+    for j in range(1, JOINTS_NUM):
+        offsets[j] = J[j] - J[parents[j]]
+    return offsets, SMPL_BODY_PARENTS
+
+
+def finedance_to_joints(path, offsets, parents, convention='rows', src_fps=30, dst_fps=60):
+    """FineDance motion (T, 315) = translation (3) + 52 joints x 6D -> body joints (T', 22, 3) at dst_fps."""
+    d = np.load(path).astype(np.float64)
+    assert d.shape[1] == 315, f'{path}: expected (T, 315), got {d.shape}'
+    trans = d[:, :3]
+    mats = rot6d_to_matrix(d[:, 3:].reshape(len(d), 52, 6)[:, :JOINTS_NUM])
+    if convention == 'cols':
+        mats = np.swapaxes(mats, -1, -2)
+    quats, trans = resample(matrix_to_quat(mats), trans, src_fps, dst_fps)
+    return smpl_fk(quats, trans, offsets, parents)
+
+
+def knee_flexion_score(joints, min_deg=20.0):
+    """Fraction of clearly bent knees that bend the anatomical way (ankle behind the knee).
+    ~1 for correctly decoded rotations; ~0 if rotations are transposed (knees hyperextend)."""
+    left = joints[:, 1] - joints[:, 2]
+    left = left / np.linalg.norm(left, axis=-1, keepdims=True)
+    ok = []
+    for hip, knee, ankle in [(1, 4, 7), (2, 5, 8)]:
+        thigh, shank = joints[:, knee] - joints[:, hip], joints[:, ankle] - joints[:, knee]
+        cos = (thigh * shank).sum(-1) / (np.linalg.norm(thigh, axis=-1) * np.linalg.norm(shank, axis=-1))
+        bent = np.degrees(np.arccos(np.clip(cos, -1, 1))) > min_deg
+        ok.append(((np.cross(thigh, shank) * left).sum(-1) > 0)[bent])
+    ok = np.concatenate(ok)
+    return (float(ok.mean()) if len(ok) else float('nan')), int(len(ok))
+
+
 # ------------------------------------------------------------------ comparison helpers
 def best_shift(a, b, max_shift=30):
     """Shift s such that a[t] ~ b[t + s]; compared on root height + ric positions."""
@@ -347,9 +409,80 @@ def cmd_aist(args):
     print(f'\nprocessed {done} sequences')
 
 
+def cmd_finedance(args):
+    offsets, parents = load_smplx_body_skeleton(args.body_model)
+    files = sorted(glob.glob(pjoin(args.root, 'motion', '*.npy')))
+    print(f'{len(files)} FineDance motion files in {args.root}/motion')
+    if args.check_convention:
+        print('6D convention check: knee score = fraction of bent knees bending the anatomical way '
+              '(correct ~1, transposed ~0)')
+        for f in files[:args.check_convention]:
+            for conv in ['rows', 'cols']:
+                j, up = to_y_up(finedance_to_joints(f, offsets, parents, conv))
+                s, n = knee_flexion_score(j)
+                print(f'  {os.path.basename(f)} convention={conv}: knee score {s:.3f} '
+                      f'({n} bent-knee frames), up axis {up}')
+        return
+    tgt, _ = target_offsets_from_features(args.ref)
+    os.makedirs(args.out_dir, exist_ok=True)
+    for f in files:
+        sid = os.path.splitext(os.path.basename(f))[0]
+        out = pjoin(args.out_dir, sid + '.npy')
+        if os.path.exists(out) and not args.overwrite:
+            continue
+        j, up = to_y_up(finedance_to_joints(f, offsets, parents, args.convention))
+        s, _ = knee_flexion_score(j)
+        feats = positions_to_hml263(j, tgt, args.feet_thre)
+        np.save(out, feats)
+        print(f'{sid}: {len(j)} frames @60fps (up {up}, knee score {s:.2f}) -> {feats.shape}')
+    print(f'done: features in {args.out_dir}')
+
+
+def cmd_render(args):
+    """Static snapshot (front view) of a 263-d feature file: n frames side by side. No ffmpeg needed."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    feats = np.load(args.file)
+    joints = recover_from_ric(torch.from_numpy(feats).float()[None], JOINTS_NUM)[0].numpy()
+    idx = np.linspace(0, min(len(joints), int(args.seconds * args.fps)) - 1, args.n_frames).astype(int)
+    fig, axes = plt.subplots(1, len(idx), figsize=(2.2 * len(idx), 4))
+    for ax, t in zip(axes, idx):
+        p = joints[t]
+        for chain, color in zip(T2M_CHAIN, ['r', 'b', 'k', 'r', 'b']):   # right=red, left=blue
+            ax.plot(p[chain, 0], p[chain, 1], color=color, lw=2)
+        ax.scatter(p[:, 0], p[:, 1], s=6, c='k')
+        ax.set_title(f'{t / args.fps:.1f}s', fontsize=9)
+        ax.set_aspect('equal')
+        ax.set_xlim(p[0, 0] - 1, p[0, 0] + 1)
+        ax.set_ylim(-0.05, 2.0)
+        ax.axis('off')
+    fig.suptitle(f'{os.path.basename(args.file)} (front view: x right, y up; red = right side)')
+    fig.tight_layout()
+    fig.savefig(args.out, dpi=80)
+    print(f'saved {args.out}')
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest='cmd', required=True)
+
+    fd = sub.add_parser('finedance', help='FineDance (T, 315) SMPL-X 6D @30fps -> 263-d @60fps')
+    fd.add_argument('--root', default='data/finedance')
+    fd.add_argument('--body_model', default='body_models/smplx/SMPLX_NEUTRAL.npz')
+    fd.add_argument('--out_dir', default='data/finedance/joint_vecs')
+    fd.add_argument('--ref', default=None)
+    fd.add_argument('--convention', choices=['rows', 'cols'], default='rows')
+    fd.add_argument('--feet_thre', type=float, default=0.002)
+    fd.add_argument('--check_convention', type=int, default=0, help='only check N files, convert nothing')
+    fd.add_argument('--overwrite', action='store_true')
+
+    rd = sub.add_parser('render', help='PNG snapshot of a 263-d feature file')
+    rd.add_argument('--file', required=True)
+    rd.add_argument('--out', required=True)
+    rd.add_argument('--n_frames', type=int, default=8)
+    rd.add_argument('--seconds', type=float, default=10.0)
+    rd.add_argument('--fps', type=float, default=60.0)
 
     st = sub.add_parser('selftest', help='UniMuMo features -> joints -> our features')
     st.add_argument('--files', nargs='*', default=None)
@@ -369,10 +502,14 @@ if __name__ == '__main__':
     ai.add_argument('--save_dir', default=None)
 
     args = ap.parse_args()
-    if args.ref is None:
+    if getattr(args, 'ref', 'unused') is None:
         args.ref = default_ref()
     if args.cmd == 'selftest':
         cmd_selftest(args)
+    elif args.cmd == 'finedance':
+        cmd_finedance(args)
+    elif args.cmd == 'render':
+        cmd_render(args)
     else:
         if args.no_compare:
             assert args.save_dir, '--no_compare needs --save_dir'
