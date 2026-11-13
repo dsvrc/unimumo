@@ -134,6 +134,8 @@ if __name__ == '__main__':
     ap.add_argument('--no_bf16', action='store_true')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--no_save', action='store_true')
+    ap.add_argument('--save_best', default=None,
+                    help='eval set name: save lm.pt whenever its motion CE improves (instead of the last step)')
     args = ap.parse_args()
     use_bf16 = not args.no_bf16
 
@@ -181,11 +183,28 @@ if __name__ == '__main__':
         log.write(json.dumps(rec) + '\n')
         log.flush()
 
+    best = {'step': 0, 'motion_ce': float('inf')}
+    if args.save_best:
+        assert args.save_best in eval_caches, f'--save_best {args.save_best} is not one of the --eval names'
+
+    def maybe_save_best(step, res):
+        if not args.save_best:
+            return
+        v = res[args.save_best]['motion_ce']
+        if v < best['motion_ce']:
+            best.update(step=step, motion_ce=v)
+            if step > 0:
+                torch.save(mm.state_dict(), pjoin(args.run_dir, 'lm.pt'))
+            with open(pjoin(args.run_dir, 'best.json'), 'w') as f:
+                json.dump({'eval': args.save_best, **best}, f)
+            print(f'  new best {args.save_best} motion CE {v:.4f} at step {step}' + (' (saved lm.pt)' if step else ''))
+
     if eval_caches:
         res = evaluate(mm, eval_caches, args.batch_size, use_bf16)
         write({'step': 0, 'eval': res})
         for k, v in res.items():
             print(f'[step 0] {k}: motion CE {v["motion_ce"]:.4f} | d_audio {v["d_audio"]:+.4f} ± {v["d_audio_sem"]:.4f}')
+        maybe_save_best(0, res)
 
     mm.train()
     mm.text_model.eval()
@@ -218,8 +237,15 @@ if __name__ == '__main__':
             for k, v in res.items():
                 print(f'[step {step}] {k}: motion CE {v["motion_ce"]:.4f} | '
                       f'd_audio {v["d_audio"]:+.4f} ± {v["d_audio_sem"]:.4f} (frac>0 {v["d_audio_frac_pos"]:.2f})')
+            maybe_save_best(step, res)
 
-    if not args.no_save:
+    if args.save_best:
+        if best['step'] == 0:
+            print(f'WARNING: {args.save_best} never improved on the pretrained model; no lm.pt saved')
+        else:
+            print(f'best {args.save_best} motion CE {best["motion_ce"]:.4f} at step {best["step"]} '
+                  f'-> {pjoin(args.run_dir, "lm.pt")}')
+    elif not args.no_save:
         torch.save(mm.state_dict(), pjoin(args.run_dir, 'lm.pt'))
         print(f'saved {pjoin(args.run_dir, "lm.pt")}')
     log.close()

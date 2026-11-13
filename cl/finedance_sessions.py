@@ -50,6 +50,19 @@ def spread_by_genre(ids, genre_of, rng):
     return out
 
 
+def pick(ordered, k, genre_of, left, min_left):
+    """Take up to k ids in order, never letting a genre's count in `left` drop below min_left."""
+    chosen = []
+    for i in ordered:
+        if len(chosen) >= k:
+            break
+        if left[genre_of[i]] - 1 < min_left:
+            continue
+        chosen.append(i)
+        left[genre_of[i]] -= 1
+    return chosen
+
+
 def main(args):
     rng = random.Random(args.seed)
     root = args.root
@@ -85,14 +98,17 @@ def main(args):
         test = [i for i in ids if i in CROSS_GENRE_TEST]
         n_official = len(test)
         n_test = max(n_official, 3, math.ceil(args.test_frac * n))
-        for i in spread_by_genre([i for i in ids if i not in test], genre_of, rng):
-            if len(test) >= n_test:
-                break
-            test.append(i)
+        # songs not yet held out, per genre; every genre keeps >= min_train songs for training
+        cand = [i for i in ids if i not in test]
+        left = Counter(genre_of[i] for i in cand)
+        test += pick(spread_by_genre(cand, genre_of, rng), n_test - n_official, genre_of, left, args.min_train)
         rest = [i for i in ids if i not in test]
         n_val = max(2, round(args.val_frac * n))
-        val = spread_by_genre(rest, genre_of, rng)[:n_val]
+        val = pick(spread_by_genre(rest, genre_of, rng), n_val, genre_of, left, args.min_train)
         train = [i for i in rest if i not in val]
+        missing = sorted(set(genre_of[i] for i in test + val) - set(genre_of[i] for i in train))
+        if missing:
+            print(f'  note: {sess} held-out genres with no training song (official test only): {missing}')
         assert not (set(train) & set(val)) and not (set(train) & set(test)) and not (set(val) & set(test))
         for split, sids in [('train', train), ('val', val), ('test', test)]:
             sids = sorted(sids)
@@ -114,5 +130,6 @@ if __name__ == '__main__':
     ap.add_argument('--root', default='data/finedance')
     ap.add_argument('--test_frac', type=float, default=0.15)
     ap.add_argument('--val_frac', type=float, default=0.15)
+    ap.add_argument('--min_train', type=int, default=1, help='songs per fine genre that must stay in train')
     ap.add_argument('--seed', type=int, default=0)
     main(ap.parse_args())
