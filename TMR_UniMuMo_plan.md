@@ -2,12 +2,14 @@
 
 > **Protocol as decided (supersedes the Session-0 parts below):**
 > - **Session 0** is the pretrained UniMuMo as downloaded. No training, and it is not an evaluation target.
-> - **Three fine-tuning sessions** (decided):
->   - **S1 = Street:** close to what UniMuMo already knows.
->   - **S2 = Chinese classical:** the largest jump in both movement and music.
->   - **S3 = Folk/ethnic.**
->   - After S2 we measure forgetting of S1; after S3, forgetting of S1 and S2. F_avg and A_avg use the paper's formulas over the three sessions.
->   - FineDance's modern/jazz/other songs are left out of the sequence. They can serve as a held-out appendix set.
+> - **Three fine-tuning sessions, aligned with the DiscoForcing `finedance_style4` benchmark** (Mix dropped, as that plan recommends):
+>   - **Order: S1 = Street → S2 = Folk → S3 = Classic.** This is DiscoForcing's escalating-drift order; distance from S1 rises 1.10 → 1.64.
+>   - **Splits use DiscoForcing's algorithm** (`cl/finedance_sessions.py`): test = official cross_genre songs per family; val = round(10%) of train from sub-genres with ≥ 3 songs, `random.Random(0)`; `--disco_dir` imports its split files directly.
+>   - After S2 we measure forgetting of S1; after S3, forgetting of S1 and S2. F_avg and A_avg use the paper's formulas.
+> - **Metrics:**
+>   - **StyleRetention** (DiscoForcing's validated style encoder on *generated* dance, `cl/eval_style.py`) is the headline forgetting number.
+>   - **Held-out motion CE** (`cl/eval_nll.py`, the Eq. 6 quantity) is the cheap per-step diagnostic.
+>   - Ground-truth and tokenizer-reconstruction rows are the reference levels.
 > - Forgetting is measured only on the fine-tuned sessions, as in the GestureLSM, TalkSHOW and MOSPA tables.
 > - Replay buffers are built only from data of fine-tuned sessions. There is **no D0 replay pool**, so Music4All is not needed.
 > - The tests of pretrained skills (AIST++, MusicCaps, captioning) are at most an appendix extra.
@@ -217,6 +219,13 @@ Why LoRA matters: reviewers will ask whether parameter-efficient tuning alone av
 ## 7. Pilot gates (run before the full grid)
 
 - **Decision (user):** G0 is **not a gate**. The protocol is S0 = checkpoint → S1 fine-tune → S2 fine-tune (forgetting of S1) → S3. d_audio is only *logged* during training, to help explain results. The one lesson kept from G0: fine-tuning can overfit, so **choose the steps per session as the step with the lowest S1 validation-song loss**, checked every 100 steps with Vanilla, and use that count for every session and method.
+- **Sessions built, first version (superseded by the DiscoForcing-aligned splits above; S1 is retrained under `runs/fd/`):**
+  - S1 Street ≈ 2.65 h, S2 Classic ≈ 2.06 h, S3 Folk ≈ 1.49 h in total;
+  - FineDance converted with SMPL-X neutral rest joints; the 6D convention is the pytorch3d "rows" one (knee check 1.000 against 0.000).
+- **S1 result (`runs/s1`, lr 1e-5, batch 16, 5 s windows, default 0.85/0.15 loss):**
+  - S1 validation motion CE fell from 3.30 (pretrained) to **2.32 at step 300**, then overfit (3.19 by step 2000).
+  - **Fixed session length = 300 steps** for every session and method. Vanilla, ER and TMR share this S1 checkpoint.
+  - d_audio stayed ≈ 0 throughout (−0.0002 ± 0.0002 at the best step).
 - **G0. Does the model use the audio? (diagnostic only)**
   - **Measure:** audio reliance Δ_audio = CE_motion(music shuffled across windows) − CE_motion(matched music), with `cl/eval_nll.py --shuffle_music`.
   - **S0 result on AIST++ val (152 windows): Δ_audio ≈ 0.0002 nats** (3.2926 against 3.2924). Teacher-forced, pretrained UniMuMo predicts dance from the dance history alone. A likely cause is that its pretraining pairs were random tracks with only the beats DTW-aligned.
