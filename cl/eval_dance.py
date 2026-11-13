@@ -52,7 +52,7 @@ HIGHER = {'StyleRetention': True, 'StyleAcc': True, 'DanceRate': True, 'StyleFD'
 def load_clips(manifest_dir, sess, clip_seconds, max_clips):
     """Non-overlapping clip_seconds clips of every test song of a session: music (32 kHz) and 263-d motion (60 fps)."""
     import librosa
-    clips = []
+    clips, bad = [], []
     for line in open(os.path.join(manifest_dir, f'{SESSIONS[sess]}_test.jsonl')):
         if not line.strip():
             continue
@@ -62,9 +62,14 @@ def load_clips(manifest_dir, sess, clip_seconds, max_clips):
         n = int(min(len(wav) / SR, len(feat) / 60) // clip_seconds)
         for k in range(min(n, max_clips) if max_clips else n):
             a = k * clip_seconds
+            f = feat[int(a * 60):int((a + clip_seconds) * 60)]
+            if not np.isfinite(f).all():  # a non-finite reference would break every distance metric
+                bad.append(f"{it['id']}@{a:g}")
+                continue
             clips.append({'id': f"{it['id']}@{a:g}", 'song': it['id'], 'family': it['family'],
-                          'wav': wav[int(a * SR):int((a + clip_seconds) * SR)],
-                          'feat': feat[int(a * 60):int((a + clip_seconds) * 60)]})
+                          'wav': wav[int(a * SR):int((a + clip_seconds) * SR)], 'feat': f})
+    if bad:
+        print(f'WARNING: {sess}: skipped {len(bad)} test clips whose motion features are not finite: {bad}', flush=True)
     return clips
 
 
@@ -232,9 +237,13 @@ def cmd_eval(a):
             print(f'[{s}] dancing {len(clips)} clips x {a.samples} sample(s)')
             joints = generate(model, clips, a.samples, a.batch_size, a.cfg, a.seed)
         reps = len(joints) // len(clips)
-        cs = ClipSet(joints, [c['wav'] for c in clips] * reps, SR, enc)
+        wavs = [c['wav'] for c in clips] * reps
+        ok = [i for i, j in enumerate(joints) if np.isfinite(j).all()]
+        if len(ok) < len(joints):
+            print(f'WARNING: {s}: {len(joints) - len(ok)} of {len(joints)} clips are not finite and are left out', flush=True)
+        cs = ClipSet([joints[i] for i in ok], [wavs[i] for i in ok], SR, enc)
         r = set_metrics(cs, fam, norm, ref=refs[s], encoder=enc)
-        r['family'] = fam
+        r['family'], r['n_nonfinite'] = fam, len(joints) - len(ok)
         results[f'{s}_test'] = r
         saved.update({f'{s}_{i}': j for i, j in enumerate(joints)})
         top = ', '.join(f'{c} {v:.2f}' for c, v in sorted(r['class_mass'].items(), key=lambda x: -x[1]))

@@ -13,7 +13,11 @@ Every function takes global joint positions (T, 22, 3): SMPL joint order, y-up, 
 """
 import numpy as np
 import scipy.linalg
+import scipy.signal
 from scipy.ndimage import gaussian_filter as G
+
+if not hasattr(scipy.signal, 'hann'):  # librosa 0.10.1's beat tracker calls scipy.signal.hann, removed in SciPy 1.13
+    scipy.signal.hann = scipy.signal.windows.hann
 from scipy.signal import argrelextrema
 from scipy.spatial.distance import pdist
 
@@ -350,6 +354,8 @@ class ClipSet:
     """Per-clip window features, style encodings, foot skating and BAS of a list of clips (computed once, so
     split-half noise floors can re-aggregate any subset of clips)."""
 
+    bas_error = None
+
     def __init__(self, joints, wavs=None, sr=32000, encoder=None):
         self.n = len(joints)
         self.kin, self.geo, self.fsr, self.bas = [], [], [], []
@@ -358,11 +364,21 @@ class ClipSet:
             self.kin.append(k)
             self.geo.append(g)
             self.fsr.append(foot_skating_ratio(j))
-            self.bas.append(bas(j, wavs[i], sr) if wavs is not None else float('nan'))
+            self.bas.append(self._bas(j, wavs[i], sr) if wavs is not None else float('nan'))
         self.prob = self.emb = self.owner = None
         if encoder is not None:
             e = encoder.encode(joints)
             self.prob, self.emb, self.owner = e['prob'], e['emb'], e['owner']
+
+    @staticmethod
+    def _bas(j, wav, sr):
+        try:
+            return bas(j, wav, sr)
+        except Exception as e:  # BAS is a sanity metric: report the failure once and keep the other metrics
+            if ClipSet.bas_error is None:
+                ClipSet.bas_error = repr(e)
+                print(f'WARNING: BAS failed and is reported as missing: {e!r}', flush=True)
+            return float('nan')
 
     def windows(self, clips=None):
         clips = range(self.n) if clips is None else clips

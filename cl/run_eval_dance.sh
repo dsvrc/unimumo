@@ -12,7 +12,8 @@ SAMPLES=${SAMPLES:-1}          # generated samples per 10 s clip (DiscoForcing p
 E=outputs/dance_eval
 R=runs/fd
 N=outputs/nll
-mkdir -p $E logs
+export NUMBA_CACHE_DIR=${NUMBA_CACHE_DIR:-$PWD/outputs/.numba_cache}   # librosa's beat tracker caches numba code
+mkdir -p $E logs $NUMBA_CACHE_DIR
 
 run() {  # run <output> <log> <command ...> : run the command unless <output> already exists
   local out=$1 log=$2; shift 2
