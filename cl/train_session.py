@@ -41,6 +41,15 @@ with kd_i the clip's deviation from the teacher under the model's own loss: Disc
 squared error to the teacher's prediction; for UniMuMo's token predictions it is KL(teacher || student) of the
 next-token distributions, masked and averaged like the cross-entropy (per codebook, then music 0.85 + motion 0.15).
 It is zero at the start of the session.
+
+STAR (--star; DiscoForcing replay.star, its random_star = ER + STAR, the paper's "STAR"): on every replay batch,
+    lam x D(theta, theta + delta),  delta^(l) = delta_0^(l) + gamma ||W^(l)|| g^(l) / ||g^(l)||
+with delta_0^(l) a random direction of norm eps ||W^(l)||, g the gradient of D at theta + delta_0, only weight
+matrices perturbed, and the gradient taken at theta + delta (Eskandar et al., ICLR 2025; DiscoForcing defaults
+lam 0.1, gamma 0.01, eps 0.001, one ascent step). D is the KL between the model's own next-token distributions and
+the perturbed model's on the same clip (the classifier divergence of STAR; DiscoForcing's diffusion model uses its
+regression counterpart), weighted like the loss (music 0.85 + motion 0.15). As in DiscoForcing, every buffer clip is
+used. With --replay_balance equal each earlier session's replay batch gets its own STAR term.
 """
 import argparse
 import copy
@@ -60,6 +69,7 @@ sys.path.insert(0, str(HERE))
 
 import numpy as np
 import torch
+from torch.func import functional_call
 
 from eval_nll import aist_manifest, read_manifest, tokenize_set, eval_set, shuffle_music, load_lm_state
 
@@ -145,6 +155,61 @@ def fixed_rng(seed):
         finally:
             np.random.set_state(np_state)
             random.setstate(py_state)
+
+
+class _Predict(torch.nn.Module):
+    """The LM's compute_predictions as a forward, so torch.func.functional_call can run it at perturbed weights."""
+
+    def __init__(self, lm):
+        super().__init__()
+        self.lm = lm
+
+    def forward(self, music, motion, cond):
+        return self.lm.compute_predictions(music, motion, 'music_motion', [], condition_tensors=cond)
+
+
+class STAR:
+    """DiscoForcing utils/cl_replay.STAR (Stability-Inducing Weight Perturbation, Eskandar et al., ICLR 2025) on
+    UniMuMo's LM: lam x D(theta, theta + delta) on a replay batch, delta = a random direction of norm eps ||W|| per
+    weight matrix plus `steps` normalised ascent steps of size gamma ||W|| on D; the loss is evaluated at
+    theta + delta (functional_call), so its gradient is taken there. D = KL(model || perturbed model) of the
+    next-token distributions, weighted like the loss. Every pass uses the same random draws (same seed)."""
+
+    def __init__(self, mm, lam=0.1, gamma=0.01, eps=1e-3, steps=1, motion_weight=0.15, use_bf16=True):
+        self.mm, self.lam, self.gamma, self.eps, self.steps = mm, lam, gamma, eps, steps
+        self.motion_weight, self.use_bf16 = motion_weight, use_bf16
+        self.names = [n for n, p in mm.model.named_parameters() if p.requires_grad and p.dim() > 1 and 'weight' in n]
+        self.fn = _Predict(mm.model)
+
+    def loss(self, music, motion):
+        params = dict(self.mm.model.named_parameters())
+        seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item())
+        cond = self.mm.prepare_text_condition(['<separation>'] * music.shape[0])
+
+        def run(override):
+            with fixed_rng(seed), torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.use_bf16):
+                if override is None:
+                    return self.fn(music, motion, cond)
+                return functional_call(self.fn, {f'lm.{n}': t for n, t in override.items()}, (music, motion, cond))
+
+        with torch.no_grad():
+            ref = run(None)
+        divergence = lambda out: lm_kd_per_sample(out, ref, self.motion_weight).mean()
+        delta = {}
+        for n in self.names:
+            w = params[n].detach()
+            z = torch.randn_like(w)
+            delta[n] = z * (self.eps * w.norm() / (z.norm() + 1e-12))
+        for _ in range(self.steps):
+            leaves = {n: (params[n].detach() + delta[n]).requires_grad_(True) for n in self.names}
+            div = divergence(run(leaves))
+            grads = torch.autograd.grad(div, [leaves[n] for n in self.names], allow_unused=True)
+            for n, g in zip(self.names, grads):
+                if g is not None:
+                    delta[n] = delta[n] + (self.gamma / self.steps) * params[n].detach().norm() * g / (g.norm() + 1e-12)
+            del leaves, grads
+        perturbed = {n: params[n] + delta[n].detach() for n in self.names}
+        return self.lam * divergence(run(perturbed))
 
 
 class ReplayStream:
@@ -273,6 +338,11 @@ if __name__ == '__main__':
     ap.add_argument('--kd_weight', type=float, default=1.0, help='weight of the distillation term (DiscoForcing 1.0)')
     ap.add_argument('--gt_weight', type=float, default=0.25,
                     help='weight of the ground-truth replay term kept beside it (DiscoForcing 0.25, DER++-style)')
+    ap.add_argument('--star', action='store_true', help='STAR on every replay batch (DiscoForcing replay.star)')
+    ap.add_argument('--star_lam', type=float, default=0.1)
+    ap.add_argument('--star_gamma', type=float, default=0.01)
+    ap.add_argument('--star_eps', type=float, default=1e-3)
+    ap.add_argument('--star_steps', type=int, default=1)
     # eval
     ap.add_argument('--eval', action='append', default=[], help='name=token_cache.pt (repeatable)')
     ap.add_argument('--eval_every', type=int, default=500)
@@ -360,6 +430,8 @@ if __name__ == '__main__':
                                for n in names)
         else:
             terms = ' + '.join(f"{args.replay_weight} x mean(w l)_{n}" for n in names)
+        if args.star:
+            terms += ' + ' + ' + '.join(f'STAR_{n}' for n in names)
         print(f'each step: {args.batch_size} current clips + {mix} replay clips; loss = L_current + {terms}'
               f"{' (buffer weights ignored)' if args.no_sample_weights else ''}")
     teacher = None
@@ -375,6 +447,13 @@ if __name__ == '__main__':
         eval_caches[name] = torch.load(p)
 
     trainable = setup_trainable(mm)
+    star = None
+    if args.star:
+        assert replay is not None, '--star needs --replay'
+        star = STAR(mm, lam=args.star_lam, gamma=args.star_gamma, eps=args.star_eps, steps=args.star_steps,
+                    motion_weight=args.motion_weight, use_bf16=use_bf16)
+        print(f'STAR: lam={args.star_lam} gamma={args.star_gamma} eps={args.star_eps} steps={args.star_steps}, '
+              f'{len(star.names)} weight tensors perturbed, D = KL(model || perturbed model) on every replay batch')
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95), weight_decay=args.weight_decay, eps=1e-8)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / max(1, args.warmup)))
 
@@ -443,6 +522,11 @@ if __name__ == '__main__':
                 total += term.item()
                 rec[f'replay_{name}'] = term.item()
                 rec[f'replay_{name}_ce_motion'] = rce_mo.mean().item()
+                if star is not None:  # DiscoForcing train_ldf.py: total += STAR loss on the same replay batch
+                    s_loss = star.loss(rmu, rmo)
+                    s_loss.backward()
+                    total += s_loss.item()
+                    rec[f'star_{name}'] = s_loss.item()
             rec['loss_total'] = total
         if not math.isfinite(total):
             sys.exit(f'non-finite loss at step {step}')
@@ -454,6 +538,7 @@ if __name__ == '__main__':
             write(rec)
             rep = ' '.join(f'{k[7:]} {v:.4f}' for k, v in rec.items()
                            if k.startswith('replay_') and not k.endswith('_ce_motion'))
+            rep += ''.join(f' {k} {v:.5f}' for k, v in rec.items() if k.startswith('star_'))
             print(f'step {step} loss {rec["loss"]:.4f} ce_mu {rec["ce_music"]:.4f} ce_mo {rec["ce_motion"]:.4f} '
                   + (f'| replay {rep} | total {rec["loss_total"]:.4f} ' if rep else '')
                   + f'gn {rec["grad_norm"]:.2f} | {(time.time() - t0) / step:.2f}s/step')

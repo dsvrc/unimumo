@@ -41,16 +41,26 @@ def val(res, s, k):
 FLOOR = ('FID_k', 'FID_g', 'StyleFD')  # distances to real dance: their real-dance reference is the split-half floor
 
 
-def num(v, w=9, d=3):
+def num(v, w=9, d=3, sign=False):
+    """v right-aligned in w characters after at least one space: fewer decimals, then e-notation, if it is too wide."""
     if np.isnan(v):
         return f'{"-":>{w}s}'
-    return f'{v:{w}.{d}f}' if abs(v) < 10 ** (w - d - 3) else f'{v:{w}.2e}'
+    p = '+' if sign else ''
+    for dd in range(d, -1, -1):
+        s = f'{v:{p}.{dd}f}'
+        if len(s) < w:
+            break
+    else:
+        s = f'{v:{p}.2e}'
+    return f'{s:>{w}s}' if len(s) < w else ' ' + s
 
 
 def fmt(v, untrained=False, w=12):
     if np.isnan(v):
         return f'{"-":>{w}s}'
     s = f'{v:.4f}' if abs(v) < 1e5 else f'{v:.3e}'
+    if len(s) + 2 * untrained >= w:  # keep a space before every cell
+        s = f'{v:.3e}'
     return f'{f"({s})":>{w}s}' if untrained else f'{s:>{w}s}'
 
 
@@ -126,8 +136,8 @@ def main():
 
         print(f'\n  Forgetting of each old session after training up to {SESS[T - 1]} (change > 0 = worse; noise = '
               'split-half std on real dance)')
-        print(f'    {"session":8s}{"metric":16s}{"S0":>9s}{"own":>9s}{"last":>9s}{"change":>9s}{"noise":>8s}'
-              f'{"SNR":>7s}{"of complete":>13s}   verdict')
+        print(f'    {"session":8s}{"metric":16s}{"S0":>9s}{"own":>9s}{"last":>9s}{"change":>10s}{"noise":>8s}'
+              f'{"SNR":>9s}{"of complete":>13s}   verdict')
         for i in range(T - 1):
             s = SESS[i]
             for metric, higher in FORGET:
@@ -141,16 +151,17 @@ def main():
                 gap = (mii - comp) if higher else (comp - mii)
                 share = change / gap if gap > 1e-9 and metric != 'DanceRate' else float('nan')
                 sh = f'{100 * share:12.0f}%' if not np.isnan(share) else f'{"-":>13s}'
-                print(f'    {s:8s}{metric:16s}{num(val(s0, s, metric))}{num(mii)}{num(miT)}{change:+9.3f}{nz:8.3f}'
-                      f'{snr:7.1f}{sh}   {verdict(change, snr, metric)}')
+                print(f'    {s:8s}{metric:16s}{num(val(s0, s, metric))}{num(mii)}{num(miT)}{num(change, 10, 3, True)}'
+                      f'{num(nz, 8)}{num(snr, 9, 1)}{sh}   {verdict(change, snr, metric)}')
             if npaths and len(npaths) == T:
                 d, se = paired_nll(npaths[i], npaths[T - 1], s)
                 mii = val({k: v for k, v in results(npaths[i]).items()}, s, 'motion_ce')
                 miT = val({k: v for k, v in results(npaths[T - 1]).items()}, s, 'motion_ce')
                 ci = f'95% CI {d - 1.96 * se:+.3f}..{d + 1.96 * se:+.3f}' if not np.isnan(se) else 'no per-window files'
                 v = '?' if np.isnan(se) else ('FORGETTING' if d - 1.96 * se > 0 else 'within noise')
-                print(f'    {s:8s}{"held-out loss":16s}{num(val(nll_s0, s, "motion_ce"))}{num(mii)}{num(miT)}{miT - mii:+9.3f}'
-                      f'{se:8.3f}{(d / se if se else float("nan")):7.1f}{"-":>13s}   {v} ({ci})')
+                print(f'    {s:8s}{"held-out loss":16s}{num(val(nll_s0, s, "motion_ce"))}{num(mii)}{num(miT)}'
+                      f'{num(miT - mii, 10, 3, True)}{num(se, 8)}{num(d / se if se else float("nan"), 9, 1)}'
+                      f'{"-":>13s}   {v} ({ci})')
         print('    (held-out loss: noise = standard error of the paired change over the same test windows; '
               'DanceRate: a drop means less dance-like output, not a style change)')
 
@@ -176,16 +187,19 @@ def main():
                             [M[i, T - 1] for i in range(T)]))
 
     if len(a.method) > 1:
-        print(f'\n{"=" * 100}\nComparison of the methods (F_avg > 0 = forgetting; final = each session after the last one)'
+        print(f'\n{"=" * 100}\nComparison of the methods (F_avg > 0 = forgetting; final = each session after the last one; final mean = their average, the usual CL "average accuracy")'
               f'\n{"=" * 100}')
         for metric in [m for m, _ in FORGET] + ['held-out loss']:
             rows = [c for c in compare if c[1] == metric]
             if not rows:
                 continue
             T = len(rows[0][4])
-            print(f'\n  {metric}\n    {"method":18s}{"F_avg":>10s}{"A_avg":>10s}' + ''.join(f'{"final " + SESS[i]:>11s}' for i in range(T)))
+            nw = max(18, max(len(r[0]) for r in rows) + 1)
+            print(f'\n  {metric}\n    {"method":{nw}s}{"F_avg":>10s}{"A_avg":>10s}'
+                  + ''.join(f'{"final " + SESS[i]:>11s}' for i in range(T)) + f'{"final mean":>12s}')
             for name, _, F_avg, A_avg, final in rows:
-                print(f'    {name:18s}{F_avg:+10.4f}{A_avg:10.4f}' + ''.join(f'{v:11.4f}' for v in final))
+                print(f'    {name:{nw}s}{num(F_avg, 10, 4, True)}{num(A_avg, 10, 4)}' + ''.join(num(v, 11, 4) for v in final)
+                      + num(float(np.mean(final)), 12, 4))
 
 
 if __name__ == '__main__':

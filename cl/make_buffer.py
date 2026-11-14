@@ -20,6 +20,22 @@ songs shorter than one window are skipped, since UniMuMo's token windows have a 
              (Satterthwaite n_eff = (tr K)^2 / ||K||_F^2: correlated channels, and clips of different songs sharing
              their music window); if the pursuit stops early, the budget is filled by the same pursuit on the same
              objective (fill 'pursuit') instead of k-center
+Baselines (DiscoForcing's, the paper's DiscoForcing table):
+  ocs        OCS-style coreset: per minibatch of 128 shuffled clips, similarity to the minibatch centroid + diversity
+             (negative mean similarity to the rest), on L2-normalised pooled clip features; top-budget by score
+  gcr        GCR, feature-based: regularised OMP (lambda 0.5) of the pooled clip features towards their sum, random
+             fill to the budget; OMP weights (mean 1) weight the replay loss
+             pooled clip features (OCS, GCR) = [mean music trajectory, mean and std of the dance latents], each block
+             scaled to unit mean norm
+  mir        MIR as a buffer criterion: rise of each clip's loss after one virtual update (first Adam step =
+             lr x sign(g), lr = the session's training rate) on a batch of 16 training windows of the same session,
+             positive part averaged over 3 virtual updates per clip (chunks of 50 clips); --train_cache required
+  csrel      CSReL (reducible loss): 5 rounds; each round trains the model from before the session (--prev_lm_state;
+             none = the pretrained LM) on the current coreset for 100 Adam steps (lr 1e-4, as DiscoForcing) and adds
+             the clips with the largest loss(theta_coreset) - loss(theta_session)
+MIR and CSReL score clips with UniMuMo's own loss (0.85 music + 0.15 motion) in eval mode, in float32 like
+DiscoForcing's builder (--score_bf16 for bfloat16). UniMuMo is deterministic in eval mode, so DiscoForcing's average
+over four fixed noise draws is a single pass here.
 
 UniMuMo's counterparts of DiscoForcing's trajectories:
   music  DiscoForcing: WanModel.music_embedding, the model's learned music input embedding, at the token rate.
@@ -32,6 +48,8 @@ Output: <out> (token cache + 'weights' + 'session', read by cl/train_session.py 
 
   python cl/make_buffer.py --method tmr --session 1 --manifest data/finedance/manifests/s1_street_train.jsonl \
       --lm_state runs/fd/s1/lm.pt --out buffers/fd/tmr/s1.pt
+  mir:   ... --method mir --train_cache outputs/token_cache/s1_train_w5_h2.5.pt
+  csrel: ... --method csrel --session 2 --lm_state runs/fd/csrel/s2/lm.pt --prev_lm_state runs/fd/s1/lm.pt
 """
 import argparse
 import json
@@ -47,9 +65,11 @@ sys.path.insert(0, str(HERE))
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 import tmr_select
 from eval_nll import MOTION_FPS, MUSIC_SR, TOKEN_RATE, load_lm_state, read_manifest
+from train_session import fixed_rng, lm_loss, lm_loss_per_sample, setup_trainable
 
 
 # ---------------------------------------------------------------- candidates: tiled training clips
@@ -332,14 +352,228 @@ def select_tmr_dance(blocks, mask, groups, budget, rng, per_dance=1, rank="energ
                              "operator_error": eps_C, "objective": hist}
 
 
+# ---------------------------------------------------------------- baselines (DiscoForcing build_replay_buffer.py,
+# utils/cl_replay.py; same code, the model-dependent parts behind the callables of the UniMuMo glue below)
+def pooled_clip_features(feats, mask, tokens):
+    """Clip-level features for OCS / GCR (DiscoForcing pooled_clip_features): pooled music trajectory + mean and std of
+    the dance latents; each block is scaled to unit mean norm so the 1024-d music block does not swamp the latent
+    stats."""
+    m = mask[..., None].float()
+    n = m.sum(1).clamp(min=1)
+    music = (feats * m).sum(1) / n
+    tok_mean = (tokens * m).sum(1) / n
+    tok_std = (((tokens - tok_mean[:, None]) ** 2 * m).sum(1) / n).sqrt()
+    blocks = [music, torch.cat([tok_mean, tok_std], 1)]
+    return torch.cat([b / (b.norm(dim=1).mean() + 1e-8) for b in blocks], 1)
+
+
+def select_ocs(feats, budget, rng, batch=128, **_):
+    """Similarity to the minibatch centroid + diversity (negative mean similarity to the rest of the minibatch),
+    on L2-normalised features, minibatches of `batch` shuffled clips; top-`budget` by score."""
+    f = torch.nn.functional.normalize(feats, dim=1)
+    score = torch.zeros(len(f))
+    order = torch.from_numpy(rng.permutation(len(f)))
+    for chunk in order.split(batch):
+        x = f[chunk]
+        S = x @ torch.nn.functional.normalize(x.mean(0, keepdim=True), dim=1).T
+        if len(x) > 1:
+            sim = x @ x.T
+            V = -(sim.sum(1) - sim.diagonal()) / (len(x) - 1)
+        else:
+            V = torch.zeros(len(x))
+        score[chunk] = S.view(-1) + V
+    return sorted(torch.topk(score, budget).indices.tolist()), None, score
+
+
+def omp_select(A, b, budget, lam=0.5, positive=True, tol=1e-4):
+    """Regularised orthogonal matching pursuit, as GCR's `orthogonalmp_reg_parallel` (CRAIG / GradMatch):
+    greedily add the column of A (dim x N) most aligned with the residual, refit ridge-regularised weights on the
+    selected columns (dropping any that turn negative when positive=True). Returns weights (N,), zero if unselected."""
+    A, b = A.double(), b.double()
+    AT = A.T
+    resid, normb = b.clone(), b.norm()
+    idx, x = [], None
+    for _ in range(budget):
+        if resid.norm() / normb < tol:
+            break
+        proj = AT @ resid
+        j = int(torch.argmax(proj if positive else proj.abs()))
+        if j in idx:
+            break
+        idx.append(j)
+        while True:
+            Ai = AT[idx]
+            x = torch.linalg.solve(Ai @ Ai.T + lam * torch.eye(len(idx), dtype=A.dtype, device=A.device), Ai @ b)
+            if not positive or len(idx) == 1 or x.min() >= 0:
+                break
+            idx.pop(int(torch.argmin(x)))
+        resid = b - AT[idx].T @ x
+    w = torch.zeros(A.shape[1], dtype=torch.float64, device=A.device)
+    if idx:
+        w[idx] = x
+    return w.float().cpu()
+
+
+def weights_to_selection(w, budget, rng):
+    """OMP weights -> (indices, weights normalised to mean 1); random clips with weight 1 fill an incomplete budget."""
+    idx = torch.nonzero(w > 0).view(-1).tolist()
+    wts = w[idx].tolist()
+    if len(idx) < budget:
+        rest = sorted(set(range(len(w))) - set(idx))
+        extra = rng.choice(rest, size=budget - len(idx), replace=False).tolist()
+        idx += extra
+        wts += [1.0] * len(extra)
+    s = sum(wts)
+    return idx, [v / s * len(wts) for v in wts]
+
+
+def select_gcr(feats, budget, rng, lam=0.5, **_):
+    g = torch.nn.functional.normalize(feats, dim=1)
+    w = omp_select(g.T, g.sum(0), budget, lam=lam)
+    idx, wts = weights_to_selection(w, budget, rng)
+    n_omp = int((w > 0).sum())
+    print(f"[gcr] OMP picked {n_omp}/{budget}" + (f", random fill {budget - n_omp}" if n_omp < budget else ""))
+    return idx, wts, None
+
+
+def select_mir(model, params, train_loss, clip_losses, n_train, N, budget, rng, lr, set_train, cand_size=50,
+               vbatch=16, evals=3, update="adam", **_):
+    """DiscoForcing select_mir. train_loss(model, idx): mean loss of training windows idx; clip_losses(model, idx):
+    per-clip loss of candidates idx in eval mode; params: the trainable parameters. The virtual update is applied in
+    place and undone from a copy, where DiscoForcing steps a deep copy: the same 'future' model. Training windows come
+    from a DataLoader(shuffle=True, drop_last=True) as DiscoForcing's clip_loader, so they are drawn the same way."""
+    # every clip is scored under exactly `evals` virtual updates: each pass over a random permutation in chunks
+    chunks = [c for _ in range(evals) for c in np.array_split(rng.permutation(N), math.ceil(N / cand_size))]
+    n_updates = len(chunks)
+    total, count = torch.zeros(N), torch.zeros(N)
+    vloader = DataLoader(range(n_train), batch_size=vbatch, shuffle=True, drop_last=True)
+    vit = iter(vloader)
+    for u, cand in enumerate(chunks):
+        try:
+            vb = next(vit)
+        except StopIteration:
+            vit = iter(vloader)
+            vb = next(vit)
+        set_train(model)
+        model.zero_grad(set_to_none=True)
+        with fixed_rng(10_000 + u):
+            train_loss(model, vb).backward()
+        saved = [p.detach().clone() for p in params]
+        with torch.no_grad():  # virtual step: first AdamW step (= lr * sign(g)) or plain SGD
+            for p in params:
+                if p.grad is not None:
+                    p -= lr * (torch.sign(p.grad) if update == "adam" else p.grad)
+        model.zero_grad(set_to_none=True)
+        future = clip_losses(model, cand.tolist())
+        with torch.no_grad():
+            for p, s in zip(params, saved):
+                p.copy_(s)
+        del saved
+        interference = future - clip_losses(model, cand.tolist())
+        total[cand] += interference.clamp(min=0)
+        count[cand] += 1
+        if u == 0:
+            print(f"[mir] interference of the first update: mean {interference.mean():.3e}, "
+                  f"positive {int((interference > 0).sum())}/{len(cand)}")
+    score = total / count.clamp(min=1)
+    print(f"[mir] {n_updates} virtual updates, every clip scored {int(count.min())}-{int(count.max())} times")
+    return sorted(torch.topk(score, budget).indices.tolist()), None, score
+
+
+def select_csrel(model, params, load_init, coreset_loss, clip_losses, N, budget, rng, set_train, rounds=5, steps=100,
+                 lr=1e-4, **_):
+    """DiscoForcing select_csrel. The model holds theta_D (trained on the whole session) on entry; load_init(model)
+    resets it to the model from before the session (DiscoForcing: a deep copy of init_model), which is then trained
+    on the current coreset (coreset_loss(model, idx) on candidates idx) with Adam and gradient clipping 1.0."""
+    ref = clip_losses(model, list(range(N)))  # theta_D: trained on the whole session
+    selected, rel_of = [], torch.full((N,), float("nan"))
+    per_round = math.ceil(budget / rounds)
+    for r in range(rounds):
+        load_init(model)  # theta_S: the pre-session model trained on the current coreset only
+        if selected:
+            opt = torch.optim.Adam(params, lr=lr)
+            loader = DataLoader(list(selected), batch_size=min(16, len(selected)), shuffle=True)
+            it, step = iter(loader), 0
+            set_train(model)
+            while step < steps:
+                try:
+                    b = next(it)
+                except StopIteration:
+                    it = iter(loader)
+                    b = next(it)
+                opt.zero_grad(set_to_none=True)
+                coreset_loss(model, b).backward()
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                opt.step()
+                step += 1
+            del opt
+        remaining = [i for i in range(N) if i not in set(selected)]
+        rel = clip_losses(model, remaining) - ref[remaining]
+        take = torch.topk(rel, min(per_round, budget - len(selected))).indices.tolist()
+        for t in take:
+            selected.append(remaining[t])
+            rel_of[remaining[t]] = rel[t]
+        print(f"[csrel] round {r + 1}/{rounds}: coreset {len(selected)}, top ReL {rel[take[0]]:.4f}, "
+              f"median ReL {rel.median():.4f}")
+        if len(selected) >= budget:
+            break
+    return sorted(selected), None, rel_of
+
+
+# ---------------------------------------------------------------- UniMuMo glue for MIR / CSReL
+def lm_set_train(mm):
+    mm.train()
+    mm.text_model.eval()  # as in training: the T5 text encoder stays in eval mode
+
+
+def lm_clip_losses(music_codes, motion_codes, motion_weight, use_bf16, batch_size=16):
+    """clip_losses(model, idx): UniMuMo's per-clip loss of the given clips in eval mode (DiscoForcing clip_losses)."""
+    @torch.no_grad()
+    def losses(mm, idx):
+        was = mm.training
+        mm.eval()
+        out = []
+        for s in range(0, len(idx), batch_size):
+            b = torch.as_tensor(idx[s:s + batch_size], dtype=torch.long)
+            per, _, _ = lm_loss_per_sample(mm, music_codes[b].to(mm.device), motion_codes[b].to(mm.device),
+                                           motion_weight, use_bf16)
+            out.append(per.float().cpu())
+        if was:
+            lm_set_train(mm)
+        return torch.cat(out)
+    return losses
+
+
+def lm_batch_loss(music_codes, motion_codes, motion_weight, use_bf16):
+    """train_loss(model, idx): UniMuMo's training loss (0.85 music + 0.15 motion) of the windows idx."""
+    def loss(mm, idx):
+        b = torch.as_tensor(idx, dtype=torch.long)
+        return lm_loss(mm, music_codes[b].to(mm.device), motion_codes[b].to(mm.device), motion_weight, use_bf16)[0]
+    return loss
+
+
+def read_lm_state(path):
+    """The LM state dict of an lm.pt (cl/eval_nll.load_lm_state's formats), on the CPU."""
+    sd = torch.load(path, map_location='cpu')
+    if isinstance(sd, dict) and 'music_motion_lm_weight' in sd:
+        sd = sd['music_motion_lm_weight']
+    elif isinstance(sd, dict) and 'state_dict' in sd:
+        sd = sd['state_dict']
+    return sd
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--method', required=True, choices=['random', 'tmr', 'tmr_joint', 'tmr_joint_neff'])
+    ap.add_argument('--method', required=True,
+                    choices=['random', 'ocs', 'gcr', 'mir', 'csrel', 'tmr', 'tmr_joint', 'tmr_joint_neff'])
     ap.add_argument('--session', type=int, required=True, help='session whose buffer is built (1, 2, ...)')
     ap.add_argument('--manifest', required=True, help="that session's training manifest (cl/finedance_sessions.py)")
     ap.add_argument('--out', required=True)
-    ap.add_argument('--lm_state', default=None, help='LM after this session (needed for tmr / tmr_joint)')
+    ap.add_argument('--lm_state', default=None, help='LM after this session (every method but random)')
+    ap.add_argument('--prev_lm_state', default=None,
+                    help='csrel: LM before this session (default: the pretrained LM, i.e. before session 1)')
+    ap.add_argument('--train_cache', default=None, help="mir: this session's training windows (token cache)")
     ap.add_argument('--ckpt', default='pretrained/full.ckpt')
     ap.add_argument('--window', type=float, default=5.0, help='clip length = the training window (seconds)')
     ap.add_argument('--cand_cache', default=None, help='default outputs/token_cache/<s>_cand_w<window>.pt')
@@ -349,18 +583,36 @@ def main():
     ap.add_argument('--mix_eps', type=float, default=0.02, help='tmr_joint log: music windows closer than this are one')
     ap.add_argument('--music_layer', type=int, default=0, help='0 = the LM music input embedding (DiscoForcing analogue)')
     ap.add_argument('--pool', type=int, default=1, help='average-pool trajectories in time (1 = the 50 Hz token rate)')
+    # baselines (DiscoForcing defaults)
+    ap.add_argument('--omp_lam', type=float, default=0.5, help='gcr: ridge of the regularised OMP')
+    ap.add_argument('--ocs_batch', type=int, default=128)
+    ap.add_argument('--mir_cand', type=int, default=50, help='mir: candidates scored per virtual update')
+    ap.add_argument('--mir_vbatch', type=int, default=16, help='mir: training windows per virtual update')
+    ap.add_argument('--mir_evals', type=int, default=3, help='mir: virtual updates each clip is scored under')
+    ap.add_argument('--mir_update', choices=['adam', 'sgd'], default='adam')
+    ap.add_argument('--mir_lr', type=float, default=None,
+                    help="mir: virtual step size (default: the training lr in args.json next to --lm_state)")
+    ap.add_argument('--csrel_rounds', type=int, default=5)
+    ap.add_argument('--csrel_steps', type=int, default=100)
+    ap.add_argument('--csrel_lr', type=float, default=1e-4)
+    ap.add_argument('--motion_weight', type=float, default=0.15, help='mir / csrel: weight of the motion CE in the loss')
+    ap.add_argument('--score_bf16', action='store_true',
+                    help='mir / csrel: bfloat16 autocast (default float32, as DiscoForcing builds its buffers)')
     a = ap.parse_args()
     t0 = time.time()
     rng = np.random.default_rng(a.seed * 1000 + a.session)
     torch.manual_seed(a.seed)
 
     model = None
+    pre_state = None  # csrel without --prev_lm_state: the pretrained LM (the model before session 1)
 
     def get_model():
-        nonlocal model
+        nonlocal model, pre_state
         if model is None:
             from unimumo.models import UniMuMo
             model = UniMuMo.from_checkpoint(a.ckpt)
+            if a.method == 'csrel' and not a.prev_lm_state:
+                pre_state = {k: v.detach().cpu().clone() for k, v in model.music_motion_lm.state_dict().items()}
             if a.lm_state:
                 load_lm_state(model, a.lm_state)
             model.music_motion_lm.eval()
@@ -375,6 +627,38 @@ def main():
     info = {}
     if a.method == 'random':
         idx, wts, score = select_random(N, budget, rng)
+    elif a.method in ('mir', 'csrel'):
+        if not a.lm_state:
+            ap.error(f'--lm_state (the model after session {a.session}) is required for {a.method}')
+        mm = get_model().music_motion_lm
+        params = setup_trainable(mm)
+        losses = lm_clip_losses(cands['music_code'], cands['motion_code'], a.motion_weight, a.score_bf16)
+        prec = 'bfloat16' if a.score_bf16 else 'float32'
+        if a.method == 'mir':
+            if not a.train_cache:
+                ap.error("--train_cache (this session's training windows) is required for mir")
+            tc = torch.load(a.train_cache, weights_only=False)
+            lr = a.mir_lr
+            run_args = os.path.join(os.path.dirname(a.lm_state), 'args.json')
+            if lr is None:
+                lr = float(json.load(open(run_args))['lr']) if os.path.exists(run_args) else 1e-5
+            print(f"[mir] {len(tc['music_code'])} training windows from {a.train_cache}; virtual {a.mir_update} step, "
+                  f"lr {lr:g}; {prec}")
+            idx, wts, score = select_mir(
+                mm, params, lm_batch_loss(tc['music_code'], tc['motion_code'], a.motion_weight, a.score_bf16), losses,
+                len(tc['music_code']), N, budget, rng, lr, lm_set_train, cand_size=a.mir_cand, vbatch=a.mir_vbatch,
+                evals=a.mir_evals, update=a.mir_update)
+            info = {'lr': lr, 'train_windows': len(tc['music_code'])}
+            del tc
+        else:
+            init = read_lm_state(a.prev_lm_state) if a.prev_lm_state else pre_state
+            print(f"[csrel] theta_D = {a.lm_state}; theta_S starts from {a.prev_lm_state or 'the pretrained LM'} each "
+                  f"round; {a.csrel_rounds} rounds x {a.csrel_steps} Adam steps, lr {a.csrel_lr:g}; {prec}")
+            idx, wts, score = select_csrel(
+                mm, params, lambda m_: m_.load_state_dict(init),
+                lm_batch_loss(cands['music_code'], cands['motion_code'], a.motion_weight, a.score_bf16), losses, N,
+                budget, rng, lm_set_train, rounds=a.csrel_rounds, steps=a.csrel_steps, lr=a.csrel_lr)
+            info = {'prev_lm_state': a.prev_lm_state or 'pretrained'}
     else:
         if not a.lm_state:
             ap.error(f'--lm_state (the model after session {a.session}) is required for {a.method}')
@@ -382,7 +666,17 @@ def main():
         music = music_trajectories(m.music_motion_lm, cands['music_code'], a.music_layer, a.pool)
         mask = torch.ones(music.shape[:2], dtype=torch.bool)
         print(f'music trajectories {tuple(music.shape)} (layer {a.music_layer}, pool {a.pool}) ({time.time() - t0:.0f}s)')
-        if a.method == 'tmr':
+        if a.method in ('ocs', 'gcr'):  # pooled music trajectory + dance-latent mean and std (DiscoForcing)
+            dance = dance_latents(m, cands['motion_code'], a.pool)
+            T = min(music.shape[1], dance.shape[1])
+            feats = pooled_clip_features(music[:, :T], mask[:, :T], dance[:, :T])
+            del music, dance
+            print(f'[{a.method}] pooled clip features {tuple(feats.shape)}')
+            if a.method == 'ocs':
+                idx, wts, score = select_ocs(feats, budget, rng, batch=a.ocs_batch)
+            else:
+                idx, wts, score = select_gcr(feats, budget, rng, lam=a.omp_lam)
+        elif a.method == 'tmr':
             idx, wts, score, info = select_tmr(music, mask, budget, rng, stop=a.tmr_stop)
         else:  # TMR on the joint music + dance trajectory (DiscoForcing: rank bic_dims + k-center fill for tmr_joint,
             # bic_neff + pursuit fill for tmr_joint_neff; per_dance 0, modal weights, first-moment match for both)
@@ -414,6 +708,8 @@ def main():
             'ratio': a.ratio, 'n_candidates': N, 'budget': budget, 'n_clips': len(idx),
             'n_songs': len(set(buf['songs'])), 'music_layer': a.music_layer, 'pool': a.pool, 'seed': a.seed,
             'tmr_stop': a.tmr_stop, 'info': {k: v for k, v in info.items() if k != 'objective'},
+            'params': {k: v for k, v in vars(a).items()
+                       if k.split('_')[0] in ('omp', 'ocs', 'mir', 'csrel', 'score', 'motion', 'prev', 'train')},
             'seconds': round(time.time() - t0, 1), 'clips': clips}
     json.dump(meta, open(os.path.splitext(a.out)[0] + '.json', 'w'), indent=1, default=float)
     w = np.array(wts)
