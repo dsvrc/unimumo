@@ -16,6 +16,10 @@ songs shorter than one window are skipped, since UniMuMo's token windows have a 
   tmr_joint  TMR on the joint trajectory [music, dance], each block scaled to unit mean squared deviation (equal
              weight), M by the BIC with N_eff = #clips x channels, simplex OMP, k-center fill to the budget if the
              pursuit stops early; OMP weights (k-center clips 1e-3) normalised to mean 1 weight the replay loss
+  tmr_joint_neff  tmr_joint with the BIC's sample count = the effective number of independent temporal vectors
+             (Satterthwaite n_eff = (tr K)^2 / ||K||_F^2: correlated channels, and clips of different songs sharing
+             their music window); if the pursuit stops early, the budget is filled by the same pursuit on the same
+             objective (fill 'pursuit') instead of k-center
 
 UniMuMo's counterparts of DiscoForcing's trajectories:
   music  DiscoForcing: WanModel.music_embedding, the model's learned music input embedding, at the token rate.
@@ -331,7 +335,7 @@ def select_tmr_dance(blocks, mask, groups, budget, rng, per_dance=1, rank="energ
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--method', required=True, choices=['random', 'tmr', 'tmr_joint'])
+    ap.add_argument('--method', required=True, choices=['random', 'tmr', 'tmr_joint', 'tmr_joint_neff'])
     ap.add_argument('--session', type=int, required=True, help='session whose buffer is built (1, 2, ...)')
     ap.add_argument('--manifest', required=True, help="that session's training manifest (cl/finedance_sessions.py)")
     ap.add_argument('--out', required=True)
@@ -380,18 +384,20 @@ def main():
         print(f'music trajectories {tuple(music.shape)} (layer {a.music_layer}, pool {a.pool}) ({time.time() - t0:.0f}s)')
         if a.method == 'tmr':
             idx, wts, score, info = select_tmr(music, mask, budget, rng, stop=a.tmr_stop)
-        else:
+        else:  # TMR on the joint music + dance trajectory (DiscoForcing: rank bic_dims + k-center fill for tmr_joint,
+            # bic_neff + pursuit fill for tmr_joint_neff; per_dance 0, modal weights, first-moment match for both)
             dance = dance_latents(m, cands['motion_code'], a.pool)
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             cond, within, between = condition_groups(music, mask, a.mix_eps, device)
-            print(f'[tmr_joint] music windows: {N} clips -> {len(set(cond))} distinct (same window: relative distance '
+            print(f'[{a.method}] music windows: {N} clips -> {len(set(cond))} distinct (same window: relative distance '
                   f'<= {within:.2e}; different windows: >= {between:.3f}; eps {a.mix_eps})')
             T = min(music.shape[1], dance.shape[1])
             song_id = {n: i for i, n in enumerate(sorted(set(cands['songs'])))}
+            rank, fill = ('bic_dims', 'kcenter') if a.method == 'tmr_joint' else ('bic_neff', 'pursuit')
             idx, wts, score, info = select_tmr_dance(
                 [music[:, :T], dance[:, :T]], mask[:, :T], [song_id[n] for n in cands['songs']], budget, rng,
-                per_dance=0, rank='bic_dims', weights='modal', stop=a.tmr_stop, label='tmr_joint', cond_groups=cond,
-                fill='kcenter')
+                per_dance=0, rank=rank, weights='modal', stop=a.tmr_stop, label=a.method, cond_groups=cond,
+                fill=fill)
 
     wts = wts or [1.0] * len(idx)
     it = torch.as_tensor(idx, dtype=torch.long)

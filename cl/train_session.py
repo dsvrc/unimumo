@@ -32,13 +32,25 @@ weights with mean 1, 1 for ER). Buffer clips are drawn without replacement and r
   --replay_balance uniform DiscoForcing's default: one replay batch drawn from the union of the buffers (sessions in
                            proportion to their buffer sizes)
 With a single earlier session (S2) the three are identical: current : S1 = 1 : 1.
+
+Distillation replay (--distill; DiscoForcing replay.distill, its "<variant>_kd" runs): the model this session starts
+from (--init_lm_state, frozen) is the teacher on every replay batch, run in the same mode with the same random draws
+as the student. Each replay term becomes
+    replay_weight x (gt_weight x mean_i(w_i l_i) + kd_weight x mean_i(w_i kd_i))      (DiscoForcing: 1 x (0.25, 1.0))
+with kd_i the clip's deviation from the teacher under the model's own loss: DiscoForcing's diffusion model uses the
+squared error to the teacher's prediction; for UniMuMo's token predictions it is KL(teacher || student) of the
+next-token distributions, masked and averaged like the cross-entropy (per codebook, then music 0.85 + motion 0.15).
+It is zero at the start of the session.
 """
 import argparse
+import copy
 import json
 import math
 import os
+import random
 import sys
 import time
+from contextlib import contextmanager
 from os.path import join as pjoin
 from pathlib import Path
 
@@ -87,13 +99,52 @@ def per_sample_ce(logits, targets, mask):
     return ((ce * m).sum(-1) / m.sum(-1).clamp(min=1)).mean(1)
 
 
-def lm_loss_per_sample(mm, music, motion, motion_weight, use_bf16):
+def lm_forward(mm, music, motion, use_bf16):
     cond = mm.prepare_text_condition(['<separation>'] * music.shape[0])
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
-        mu_out, mo_out = mm.model.compute_predictions(music, motion, 'music_motion', [], condition_tensors=cond)
+        return mm.model.compute_predictions(music, motion, 'music_motion', [], condition_tensors=cond)
+
+
+def lm_loss_per_sample(mm, music, motion, motion_weight, use_bf16, outputs=None):
+    mu_out, mo_out = outputs if outputs is not None else lm_forward(mm, music, motion, use_bf16)
     ce_mu = per_sample_ce(mu_out.logits.float(), music, mu_out.mask)
     ce_mo = per_sample_ce(mo_out.logits.float(), motion, mo_out.mask)
     return (1 - motion_weight) * ce_mu + motion_weight * ce_mo, ce_mu.detach(), ce_mo.detach()
+
+
+def per_sample_kl(s_logits, t_logits, mask):
+    """Per-clip KL(teacher || student) of the next-token distributions, averaged like per_sample_ce (each codebook's
+    valid tokens, then codebooks); invalid delay-pattern positions (NaN logits) are masked out first."""
+    invalid = ~mask.unsqueeze(-1)
+    ls = torch.log_softmax(s_logits.float().masked_fill(invalid, 0.0), -1)
+    lt = torch.log_softmax(t_logits.float().masked_fill(invalid, 0.0), -1)
+    kl = (lt.exp() * (lt - ls)).sum(-1)  # (B, K, T)
+    m = mask.float()
+    return ((kl * m).sum(-1) / m.sum(-1).clamp(min=1)).mean(1)
+
+
+def lm_kd_per_sample(student, teacher, motion_weight):
+    """The clip's deviation from the teacher under the model's own loss: music 0.85 + motion 0.15 of the KL."""
+    (s_mu, s_mo), (t_mu, t_mo) = student, teacher
+    return ((1 - motion_weight) * per_sample_kl(s_mu.logits, t_mu.logits, s_mu.mask)
+            + motion_weight * per_sample_kl(s_mo.logits, t_mo.logits, s_mo.mask))
+
+
+@contextmanager
+def fixed_rng(seed):
+    """DiscoForcing utils/cl_replay.fixed_rng: the same seed gives the same random draws (torch CPU / CUDA, numpy,
+    random) inside the block; the global streams are restored afterwards."""
+    np_state, py_state = np.random.get_state(), random.getstate()
+    devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        np.random.seed(seed % 2 ** 32)
+        random.seed(seed)
+        try:
+            yield
+        finally:
+            np.random.set_state(np_state)
+            random.setstate(py_state)
 
 
 class ReplayStream:
@@ -216,6 +267,12 @@ if __name__ == '__main__':
     ap.add_argument('--replay_weight', type=float, default=1.0, help='lambda of every replay term (DiscoForcing 1.0)')
     ap.add_argument('--replay_balance', choices=['equal', 'session', 'uniform'], default='equal')
     ap.add_argument('--no_sample_weights', action='store_true', help='ignore the buffer weights (all 1)')
+    ap.add_argument('--distill', action='store_true',
+                    help='distillation replay (DiscoForcing replay.distill): the --init_lm_state model, frozen, is the '
+                         'teacher on the replay batches')
+    ap.add_argument('--kd_weight', type=float, default=1.0, help='weight of the distillation term (DiscoForcing 1.0)')
+    ap.add_argument('--gt_weight', type=float, default=0.25,
+                    help='weight of the ground-truth replay term kept beside it (DiscoForcing 0.25, DER++-style)')
     # eval
     ap.add_argument('--eval', action='append', default=[], help='name=token_cache.pt (repeatable)')
     ap.add_argument('--eval_every', type=int, default=500)
@@ -298,9 +355,20 @@ if __name__ == '__main__':
         else:
             mix = f"{replay.batch_size} from {'+'.join('S%d' % c['session'] for c in buffers)} ({args.replay_balance})"
             names = ['replay']
-        terms = ' + '.join(f"{args.replay_weight} x mean(w l)_{n}" for n in names)
+        if args.distill:
+            terms = ' + '.join(f"{args.replay_weight} x ({args.gt_weight} x mean(w l) + {args.kd_weight} x mean(w kd))_{n}"
+                               for n in names)
+        else:
+            terms = ' + '.join(f"{args.replay_weight} x mean(w l)_{n}" for n in names)
         print(f'each step: {args.batch_size} current clips + {mix} replay clips; loss = L_current + {terms}'
               f"{' (buffer weights ignored)' if args.no_sample_weights else ''}")
+    teacher = None
+    if args.distill:
+        assert replay is not None and args.init_lm_state, '--distill needs --replay and --init_lm_state (the teacher)'
+        teacher = copy.deepcopy(mm)  # the model this session starts from, before any update
+        teacher.requires_grad_(False)
+        print(f'distillation replay: teacher = {args.init_lm_state} (frozen, same mode and random draws as the '
+              f'student), kd = KL(teacher || student), kd_weight {args.kd_weight}, gt_weight {args.gt_weight}')
     eval_caches = {}
     for spec in args.eval:
         name, p = spec.split('=', 1)
@@ -354,8 +422,23 @@ if __name__ == '__main__':
         if replay is not None:
             for name, picks in replay.next():
                 rmu, rmo, w = replay.tensors(picks, not args.no_sample_weights)
-                per, _, rce_mo = lm_loss_per_sample(mm, rmu.to(dev), rmo.to(dev), args.motion_weight, use_bf16)
-                term = args.replay_weight * (w.to(dev) * per).mean()
+                rmu, rmo, w = rmu.to(dev), rmo.to(dev), w.to(dev)
+                if teacher is None:
+                    per, _, rce_mo = lm_loss_per_sample(mm, rmu, rmo, args.motion_weight, use_bf16)
+                    term = args.replay_weight * (w * per).mean()
+                else:  # DiscoForcing train_ldf.py: teacher and student see identical random draws (same seed)
+                    seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item())
+                    teacher.train(mm.training)
+                    teacher.text_model.eval()
+                    with torch.no_grad(), fixed_rng(seed):
+                        t_out = lm_forward(teacher, rmu, rmo, use_bf16)
+                    with fixed_rng(seed):
+                        s_out = lm_forward(mm, rmu, rmo, use_bf16)
+                    per, _, rce_mo = lm_loss_per_sample(mm, rmu, rmo, args.motion_weight, use_bf16, outputs=s_out)
+                    kd_loss = (w * lm_kd_per_sample(s_out, t_out, args.motion_weight)).mean()
+                    term = args.replay_weight * (args.gt_weight * (w * per).mean() + args.kd_weight * kd_loss)
+                    rec[f'replay_{name}_kd'] = kd_loss.item()
+                    del t_out
                 term.backward()
                 total += term.item()
                 rec[f'replay_{name}'] = term.item()
