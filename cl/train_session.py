@@ -80,6 +80,7 @@ def per_sample_ce(logits, targets, mask):
     """Per-clip MusicMotionTransformer.compute_cross_entropy: mean over each codebook's valid tokens, then over
     codebooks. Its batch mean equals the batch value, since every clip has the same valid tokens."""
     B, K, T = targets.shape
+    logits = logits.masked_fill(~mask.unsqueeze(-1), 0.0)  # invalid (delay-pattern) positions hold NaN logits
     ce = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
                                            reduction='none').view(B, K, T)
     m = mask.float()
