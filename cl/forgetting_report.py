@@ -111,6 +111,7 @@ def main():
     nll = {spec.split('=', 1)[0]: spec.split('=', 1)[1].split(',') for spec in a.nll}
     nll_s0 = {k: {'motion_ce': v['motion_ce']} for k, v in results(a.nll_s0).items()} if a.nll_s0 else {}
 
+    compare = []  # (method, metric, F_avg, A_avg, final value per old session)
     for spec in a.method:
         name, paths = spec.split('=', 1)
         stages = [results(p) for p in paths.split(',')]
@@ -167,6 +168,24 @@ def main():
             F = [np.mean([sgn * (M[i, i] - M[i, t]) for t in range(i + 1, T)]) for i in range(T - 1)]
             print(f'    {metric:16s} F_avg {np.mean(F):+.4f}   A_avg {np.mean(np.diag(M)):.4f}   '
                   f'F_i {" ".join(f"{f:+.4f}" for f in F)}')
+            compare.append((name, metric, float(np.mean(F)), float(np.mean(np.diag(M))), [M[i, T - 1] for i in range(T)]))
+        if npaths and len(npaths) == T:
+            M = np.array([[val(nstages[t], SESS[i], 'motion_ce') for t in range(T)] for i in range(T)])
+            F = [np.mean([M[i, t] - M[i, i] for t in range(i + 1, T)]) for i in range(T - 1)]
+            compare.append((name, 'held-out loss', float(np.mean(F)), float(np.mean(np.diag(M))),
+                            [M[i, T - 1] for i in range(T)]))
+
+    if len(a.method) > 1:
+        print(f'\n{"=" * 100}\nComparison of the methods (F_avg > 0 = forgetting; final = each session after the last one)'
+              f'\n{"=" * 100}')
+        for metric in [m for m, _ in FORGET] + ['held-out loss']:
+            rows = [c for c in compare if c[1] == metric]
+            if not rows:
+                continue
+            T = len(rows[0][4])
+            print(f'\n  {metric}\n    {"method":18s}{"F_avg":>10s}{"A_avg":>10s}' + ''.join(f'{"final " + SESS[i]:>11s}' for i in range(T)))
+            for name, _, F_avg, A_avg, final in rows:
+                print(f'    {name:18s}{F_avg:+10.4f}{A_avg:10.4f}' + ''.join(f'{v:11.4f}' for v in final))
 
 
 if __name__ == '__main__':

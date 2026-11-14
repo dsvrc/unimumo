@@ -16,10 +16,22 @@ G0 pilot (real AIST++ pairs -> does the model start using the music?):
 
 Later sessions:
     --init_lm_state runs/<method>/s1/lm.pt     start from the previous session
-    --replay buffer.pt                         token cache of replayed windows (optional 'weights')
     --schedule_from runs/fd/s1                 same session length and warm-up as S1, counted in passes
                                                (epochs) over this session's own windows, so a smaller
                                                session is not trained for more epochs than S1 was
+    --replay buffers/fd/<m>/s1.pt [--replay buffers/fd/<m>/s2.pt]   the buffers of the earlier sessions
+
+Replay (DiscoForcing utils/cl_replay.py + train_ldf.py): every step adds, per replay batch, replay_weight x
+mean_i(w_i l_i) to the current loss, with l_i the clip's own loss and w_i its buffer weight (TMR / TMR-joint OMP
+weights with mean 1, 1 for ER). Buffer clips are drawn without replacement and reshuffled once used up.
+  --replay_balance equal   (default) every earlier session gets its own replay batch of --batch_size clips and its
+                           own replay_weight-weighted term: the current session and each earlier session weigh the
+                           same, in the batch and in the loss (S3: current : S1 : S2 = 1 : 1 : 1)
+  --replay_balance session DiscoForcing balance=session: one replay batch of --batch_size with equal clips per
+                           earlier session (S3: current : S1 : S2 = 2 : 1 : 1)
+  --replay_balance uniform DiscoForcing's default: one replay batch drawn from the union of the buffers (sessions in
+                           proportion to their buffer sizes)
+With a single earlier session (S2) the three are identical: current : S1 = 1 : 1.
 """
 import argparse
 import json
@@ -64,12 +76,77 @@ def lm_loss(mm, music, motion, motion_weight, use_bf16):
     return (1 - motion_weight) * ce_mu + motion_weight * ce_mo, ce_mu.detach(), ce_mo.detach()
 
 
-def sample(cache, n, gen, weights=None):
+def per_sample_ce(logits, targets, mask):
+    """Per-clip MusicMotionTransformer.compute_cross_entropy: mean over each codebook's valid tokens, then over
+    codebooks. Its batch mean equals the batch value, since every clip has the same valid tokens."""
+    B, K, T = targets.shape
+    ce = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1),
+                                           reduction='none').view(B, K, T)
+    m = mask.float()
+    return ((ce * m).sum(-1) / m.sum(-1).clamp(min=1)).mean(1)
+
+
+def lm_loss_per_sample(mm, music, motion, motion_weight, use_bf16):
+    cond = mm.prepare_text_condition(['<separation>'] * music.shape[0])
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
+        mu_out, mo_out = mm.model.compute_predictions(music, motion, 'music_motion', [], condition_tensors=cond)
+    ce_mu = per_sample_ce(mu_out.logits.float(), music, mu_out.mask)
+    ce_mo = per_sample_ce(mo_out.logits.float(), motion, mo_out.mask)
+    return (1 - motion_weight) * ce_mu + motion_weight * ce_mo, ce_mu.detach(), ce_mo.detach()
+
+
+class ReplayStream:
+    """Replay batches over the buffers of the earlier sessions (DiscoForcing ReplayStream / SessionBalancedBatches).
+    equal: one batch of `batch_size` per buffer; session: one batch with equal clips per buffer (remainder slots
+    rotate over the buffers); uniform: one shuffled batch from the union (an incomplete last batch of a pass is
+    dropped, as DataLoader(shuffle=True, drop_last=True)). Each buffer's clips are drawn without replacement and
+    reshuffled once used up."""
+
+    def __init__(self, buffers, batch_size, balance, seed=0):
+        self.buffers, self.balance = buffers, balance
+        self.rng = np.random.default_rng(seed)
+        self.n = [b['music_code'].shape[0] for b in buffers]
+        self.pools = [[] for _ in buffers]
+        self.offset = 0
+        if balance == 'uniform':
+            self.union = [(j, i) for j, n in enumerate(self.n) for i in range(n)]
+            self.batch_size = min(batch_size, len(self.union))
+            self.upool = []
+        elif balance == 'session':
+            self.batch_size = min(batch_size, sum(self.n))
+        else:
+            self.batch_size = [min(batch_size, n) for n in self.n]
+
+    def _pop(self, j):
+        if not self.pools[j]:
+            self.pools[j] = self.rng.permutation(self.n[j]).tolist()
+        return self.pools[j].pop()
+
+    def next(self):
+        """[(name, [(buffer, clip), ...]), ...]: one entry per replay term of this step."""
+        if self.balance == 'equal':
+            return [(f's{self.buffers[j]["session"]}', [(j, self._pop(j)) for _ in range(self.batch_size[j])])
+                    for j in range(len(self.buffers))]
+        if self.balance == 'session':
+            k = len(self.buffers)
+            batch = [((self.offset + s) % k, None) for s in range(self.batch_size)]
+            self.offset = (self.offset + self.batch_size) % k
+            return [('replay', [(j, self._pop(j)) for j, _ in batch])]
+        if len(self.upool) < self.batch_size:
+            self.upool = [self.union[i] for i in self.rng.permutation(len(self.union))]
+        batch, self.upool = self.upool[:self.batch_size], self.upool[self.batch_size:]
+        return [('replay', batch)]
+
+    def tensors(self, picks, use_weights):
+        mu = torch.stack([self.buffers[j]['music_code'][i] for j, i in picks])
+        mo = torch.stack([self.buffers[j]['motion_code'][i] for j, i in picks])
+        w = torch.tensor([float(self.buffers[j]['weights'][i]) if use_weights else 1.0 for j, i in picks])
+        return mu, mo, w
+
+
+def sample(cache, n, gen):
     N = cache['music_code'].shape[0]
-    if weights is None:
-        idx = torch.randint(0, N, (n,), generator=gen)
-    else:
-        idx = torch.multinomial(weights, n, replacement=True, generator=gen)
+    idx = torch.randint(0, N, (n,), generator=gen)
     return cache['music_code'][idx], cache['motion_code'][idx]
 
 
@@ -133,8 +210,11 @@ if __name__ == '__main__':
     ap.add_argument('--window', type=float, default=5.0)
     ap.add_argument('--hop', type=float, default=2.5)
     # replay
-    ap.add_argument('--replay', action='append', default=[], help='token cache of replay windows (repeatable)')
-    ap.add_argument('--replay_lambda', type=float, default=1.0)
+    ap.add_argument('--replay', action='append', default=[],
+                    help='replay buffer of an earlier session (cl/make_buffer.py); one per earlier session')
+    ap.add_argument('--replay_weight', type=float, default=1.0, help='lambda of every replay term (DiscoForcing 1.0)')
+    ap.add_argument('--replay_balance', choices=['equal', 'session', 'uniform'], default='equal')
+    ap.add_argument('--no_sample_weights', action='store_true', help='ignore the buffer weights (all 1)')
     # eval
     ap.add_argument('--eval', action='append', default=[], help='name=token_cache.pt (repeatable)')
     ap.add_argument('--eval_every', type=int, default=500)
@@ -198,12 +278,28 @@ if __name__ == '__main__':
     ep = lambda step: step * args.batch_size / n_train
     print(f'train windows: {n_train} | session: {args.steps} steps = {ep(args.steps):.2f} epochs, '
           f'warm-up {args.warmup} steps = {ep(args.warmup):.2f} epochs')
-    replay = []
-    for p in args.replay:
-        c = torch.load(p)
-        w = c.get('weights')
-        replay.append((c, None if w is None else torch.as_tensor(w, dtype=torch.float)))
-        print(f'replay buffer {p}: {c["music_code"].shape[0]} windows, weighted={w is not None}')
+    replay = None
+    if args.replay:
+        buffers = []
+        for p in args.replay:
+            c = torch.load(p, weights_only=False)
+            c['weights'] = torch.as_tensor(c.get('weights', torch.ones(c['music_code'].shape[0])), dtype=torch.float)
+            c.setdefault('session', len(buffers) + 1)
+            w = c['weights'].double()
+            print(f"replay buffer S{c['session']} {p}: {len(w)} clips ({c.get('method', '?')}), weights mean "
+                  f"{w.mean():.3f} min {w.min():.3f} max {w.max():.3f}, effective size {w.sum() ** 2 / (w ** 2).sum():.1f}")
+            assert c['music_code'].shape[1:] == train_cache['music_code'].shape[1:], f'{p}: clip length differs from training'
+            buffers.append(c)
+        replay = ReplayStream(buffers, args.batch_size, args.replay_balance, seed=args.seed)
+        if args.replay_balance == 'equal':
+            mix = ' + '.join(f"{b} x S{c['session']}" for b, c in zip(replay.batch_size, buffers))
+            names = [f"s{c['session']}" for c in buffers]
+        else:
+            mix = f"{replay.batch_size} from {'+'.join('S%d' % c['session'] for c in buffers)} ({args.replay_balance})"
+            names = ['replay']
+        terms = ' + '.join(f"{args.replay_weight} x mean(w l)_{n}" for n in names)
+        print(f'each step: {args.batch_size} current clips + {mix} replay clips; loss = L_current + {terms}'
+              f"{' (buffer weights ignored)' if args.no_sample_weights else ''}")
     eval_caches = {}
     for spec in args.eval:
         name, p = spec.split('=', 1)
@@ -249,16 +345,22 @@ if __name__ == '__main__':
     t0 = time.time()
     for step in range(1, args.steps + 1):
         mu, mo = sample(train_cache, args.batch_size, gen)
+        opt.zero_grad(set_to_none=True)
         loss, ce_mu, ce_mo = lm_loss(mm, mu.to(dev), mo.to(dev), args.motion_weight, use_bf16)
         rec = {'step': step, 'loss': loss.item(), 'ce_music': ce_mu.item(), 'ce_motion': ce_mo.item()}
-        for i, (rc, rw) in enumerate(replay):
-            rmu, rmo = sample(rc, args.batch_size, gen, rw)
-            rloss, _, rce_mo = lm_loss(mm, rmu.to(dev), rmo.to(dev), args.motion_weight, use_bf16)
-            loss = loss + args.replay_lambda * rloss
-            rec[f'replay{i}_ce_motion'] = rce_mo.item()
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        if not math.isfinite(loss.item()):
+        loss.backward()  # each term is backpropagated on its own: same gradient as their sum, one graph in memory
+        total = loss.item()
+        if replay is not None:
+            for name, picks in replay.next():
+                rmu, rmo, w = replay.tensors(picks, not args.no_sample_weights)
+                per, _, rce_mo = lm_loss_per_sample(mm, rmu.to(dev), rmo.to(dev), args.motion_weight, use_bf16)
+                term = args.replay_weight * (w.to(dev) * per).mean()
+                term.backward()
+                total += term.item()
+                rec[f'replay_{name}'] = term.item()
+                rec[f'replay_{name}_ce_motion'] = rce_mo.mean().item()
+            rec['loss_total'] = total
+        if not math.isfinite(total):
             sys.exit(f'non-finite loss at step {step}')
         rec['grad_norm'] = torch.nn.utils.clip_grad_norm_(trainable, args.max_norm).item()
         opt.step()
@@ -266,8 +368,11 @@ if __name__ == '__main__':
         rec['lr'] = sched.get_last_lr()[0]
         if step % 50 == 0:
             write(rec)
+            rep = ' '.join(f'{k[7:]} {v:.4f}' for k, v in rec.items()
+                           if k.startswith('replay_') and not k.endswith('_ce_motion'))
             print(f'step {step} loss {rec["loss"]:.4f} ce_mu {rec["ce_music"]:.4f} ce_mo {rec["ce_motion"]:.4f} '
-                  f'gn {rec["grad_norm"]:.2f} | {(time.time() - t0) / step:.2f}s/step')
+                  + (f'| replay {rep} | total {rec["loss_total"]:.4f} ' if rep else '')
+                  + f'gn {rec["grad_norm"]:.2f} | {(time.time() - t0) / step:.2f}s/step')
         if eval_caches and (step % args.eval_every == 0 or step == args.steps):
             res = evaluate(mm, eval_caches, args.batch_size, use_bf16)
             write({'step': step, 'epochs': ep(step), 'eval': res})

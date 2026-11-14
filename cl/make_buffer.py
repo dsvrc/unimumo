@@ -1,24 +1,37 @@
-"""Replay buffers for the UniMuMo continual sessions.
+"""Replay buffer of one continual session of UniMuMo, ported from DiscoForcing (scripts/build_replay_buffer.py,
+utils/cl_replay.py; the selection core scripts/evidence/tmr_select.py is cl/tmr_select.py, unchanged).
 
-A buffer is a token-cache dict {'music_code', 'motion_code', 'ids', 'weights', ...} that
-cl/train_session.py --replay reads (sampling windows with probability proportional to 'weights').
+Run right after session j has been trained, with this method's model after session j. Buffers start at session 1
+(the pretrained checkpoint gets none): S2 replays the buffer of S1, S3 the buffers of S1 and S2.
+Candidates = the session's training clips: non-overlapping windows of the training window length tiling every
+training song, plus one end-aligned window when the remainder is at least half a window (DiscoForcing tile_clips;
+songs shorter than one window are skipped, since UniMuMo's token windows have a fixed length). The buffer keeps
+--ratio of them: budget = max(1, round(ratio x #candidates)) = 10 % of the session's clips.
 
-  # ER: random 10% of a session's training windows
-  python cl/make_buffer.py random --train_cache runs/s1/train_tokens.pt --out runs/buffers/er_s1.pt
+  random     ER: uniform sample; weights 1
+  tmr        TMR (paper Algorithm 1, OMP variant): music trajectories phi_i -> temporal operator -> M modes by the
+             PPCA BIC (n_eff = N D) -> whitened modal atoms -> simplex-constrained OMP towards the mean atom. It stops
+             early when no clip lowers the modal error (the buffer is then smaller than the budget, as in DiscoForcing);
+             its weights x |buffer| (mean 1) weight the replay loss
+  tmr_joint  TMR on the joint trajectory [music, dance], each block scaled to unit mean squared deviation (equal
+             weight), M by the BIC with N_eff = #clips x channels, simplex OMP, k-center fill to the budget if the
+             pursuit stops early; OMP weights (k-center clips 1e-3) normalised to mean 1 weight the replay loss
 
-  # TMR: music-stream trajectories phi from the session checkpoint -> C_k -> rank -> whitening -> NN-OMP
-  python cl/make_buffer.py tmr --lm_state runs/s1/lm.pt --train_cache runs/s1/train_tokens.pt \
-      --out runs/buffers/tmr_s1.pt [--layer 12] [--solver omp]
+UniMuMo's counterparts of DiscoForcing's trajectories:
+  music  DiscoForcing: WanModel.music_embedding, the model's learned music input embedding, at the token rate.
+         Here: the LM's music input embedding sum_k emb_k(code_k) at every 50 Hz token (--music_layer 0, default);
+         --music_layer L > 0 uses layer L's music-stream hidden state instead (motion masked, null text).
+  dance  DiscoForcing: the VAE latents of the dance (the generator's target). Here: the motion tokenizer's latents
+         of the clip, motion_vqvae.quantizer.decode(motion codes): 128-d at 50 Hz.
 
-  # before S3: one buffer for all past sessions
-  python cl/make_buffer.py merge --inputs runs/buffers/er_s1.pt runs/buffers/er_s2.pt --out runs/buffers/er_s1s2.pt
+Output: <out> (token cache + 'weights' + 'session', read by cl/train_session.py --replay) and <out>.json (summary).
 
-NOTE: tmr_select() below is a PROVISIONAL reading of the paper (Eqs. 10-14). The rank criterion of
-Eq. 12 is replaced by a 95%-explained-variance rule (or a PPCA-BIC, --rank_rule ppca_bic). For the
-paper's numbers, replace tmr_select() with the implementation used for GestureLSM / TalkSHOW / MOSPA,
-so all four backbones use identical selection.
+  python cl/make_buffer.py --method tmr --session 1 --manifest data/finedance/manifests/s1_street_train.jsonl \
+      --lm_state runs/fd/s1/lm.pt --out buffers/fd/tmr/s1.pt
 """
 import argparse
+import json
+import math
 import os
 import sys
 import time
@@ -31,22 +44,67 @@ sys.path.insert(0, str(HERE))
 import numpy as np
 import torch
 
-
-def subset(cache, idx, weights=None, extra=None):
-    idx = torch.as_tensor(np.asarray(idx), dtype=torch.long)
-    out = {'music_code': cache['music_code'][idx].clone(), 'motion_code': cache['motion_code'][idx].clone(),
-           'ids': [cache['ids'][i] for i in idx.tolist()], 'indices': idx,
-           'weights': torch.ones(len(idx)) if weights is None else torch.as_tensor(weights, dtype=torch.float)}
-    out.update(extra or {})
-    return out
+import tmr_select
+from eval_nll import MOTION_FPS, MUSIC_SR, TOKEN_RATE, load_lm_state, read_manifest
 
 
-# ------------------------------------------------------------------ phi: audio trajectories from the LM
+# ---------------------------------------------------------------- candidates: tiled training clips
+def tile_starts(n_tok, clip_len):
+    """DiscoForcing tile_clips in tokens. The end-aligned start is moved down to a multiple of 5 tokens (= 6 motion
+    frames at 60 fps), so music and motion stay sample-aligned."""
+    if n_tok < clip_len:
+        return []
+    starts = list(range(0, n_tok - clip_len + 1, clip_len))
+    if n_tok - (starts[-1] + clip_len) >= clip_len // 2:
+        starts.append((n_tok - clip_len) // 5 * 5)
+    return starts
+
+
 @torch.no_grad()
-def audio_trajectories(mm, music_codes, layer=12, pool=2, batch_size=32, use_bf16=True):
-    """Music-stream hidden state of transformer layer `layer` (1-based; 0 = summed token embeddings),
-    motion stream masked with the special token, null text, training-time causal mask.
-    Returns float32 array (N, T/pool, D)."""
+def candidate_cache(get_model, manifest, window, path, batch_size=16):
+    """Token cache of a session's candidate clips (built once; the tokenizers are frozen, so it is shared by every
+    method and model)."""
+    if os.path.exists(path):
+        c = torch.load(path, weights_only=False)
+        assert abs(c['window'] - window) < 1e-6 and c['manifest'] == manifest, f'{path} was built for another setting'
+        return c
+    import librosa
+    model = get_model()
+    clip_len = int(round(window * TOKEN_RATE))
+    n_mu, n_mo = clip_len * MUSIC_SR // TOKEN_RATE, clip_len * MOTION_FPS // TOKEN_RATE
+    mus, mots, ids, songs = [], [], [], []
+    items = read_manifest(manifest)
+    for it in items:
+        wav, _ = librosa.load(it['music'], sr=MUSIC_SR)
+        mot = np.load(it['motion']).astype(np.float32)
+        n_tok = int(min(len(wav) / MUSIC_SR, len(mot) / MOTION_FPS) * TOKEN_RATE)
+        for s in tile_starts(n_tok, clip_len):
+            a, b = s * MUSIC_SR // TOKEN_RATE, s * MOTION_FPS // TOKEN_RATE
+            mus.append(wav[a:a + n_mu])
+            mots.append(mot[b:b + n_mo])
+            ids.append(f"{it['id']}@{s / TOKEN_RATE:.2f}")
+            songs.append(it['id'])
+    music_codes, motion_codes = [], []
+    for i in range(0, len(ids), batch_size):
+        c_mu = model.encode_music(np.stack(mus[i:i + batch_size])[:, None, :]).cpu()
+        c_mo = model.encode_motion(np.stack(mots[i:i + batch_size])).cpu()
+        t = min(c_mu.shape[-1], c_mo.shape[-1], clip_len)
+        music_codes.append(c_mu[..., :t])
+        motion_codes.append(c_mo[..., :t])
+    c = {'ids': ids, 'songs': songs, 'music_code': torch.cat(music_codes), 'motion_code': torch.cat(motion_codes),
+         'window': window, 'manifest': manifest}
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    torch.save(c, path)
+    print(f'candidates: {len(items)} songs -> {len(ids)} clips of {window:g} s -> {path}')
+    return c
+
+
+# ---------------------------------------------------------------- trajectories
+@torch.no_grad()
+def music_trajectories(mm, music_codes, layer=0, pool=1, batch_size=32, use_bf16=True):
+    """(N, T, D) music trajectories of the clips: layer 0 = the LM's music input embedding sum_k emb_k(code_k) at
+    the token rate; layer L > 0 = the music-stream hidden state of transformer layer L (motion stream masked with
+    the special token, null text, the training-time attention mask)."""
     lm = mm.model
     lm.eval()
     K, T = music_codes.shape[1], music_codes.shape[2]
@@ -55,13 +113,12 @@ def audio_trajectories(mm, music_codes, layer=12, pool=2, batch_size=32, use_bf1
         mu = music_codes[i:i + batch_size].to(mm.device)
         B = mu.shape[0]
         if layer == 0:
-            h = sum(lm.emb[k](mu[:, k]) for k in range(K))                         # (B, T, D)
+            h = sum(lm.emb[k](mu[:, k]) for k in range(K))
         else:
             pat = lm.pattern_provider.get_pattern(T)
             mus, _, _ = pat.build_pattern_sequence(mu, lm.special_token_id, keep_only_valid_steps=True)
-            mot = torch.full_like(mus, lm.special_token_id)
-            seq = torch.cat([mus, mot], dim=-1)
-            src_mask = lm.get_self_attn_mask(mus.shape[-1], mot.shape[-1], 'music_motion')
+            seq = torch.cat([mus, torch.full_like(mus, lm.special_token_id)], dim=-1)
+            src_mask = lm.get_self_attn_mask(mus.shape[-1], mus.shape[-1], 'music_motion')
             cond = mm.prepare_text_condition(['<separation>'] * B)
             cross_mask = torch.where(cond['description'][-1], 0., float('-inf'))
             grab = {}
@@ -69,139 +126,293 @@ def audio_trajectories(mm, music_codes, layer=12, pool=2, batch_size=32, use_bf1
             with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
                 lm(seq, [], src_mask=src_mask, condition_tensors=cond, cross_attn_mask=cross_mask)
             hook.remove()
-            h = grab['h'][:, :mus.shape[-1]]                                         # music half
-            h = h[:, -T:]                                                            # drop delay-pattern padding
+            h = grab['h'][:, :mus.shape[-1]][:, -T:]  # music half, delay-pattern padding dropped
         h = h.float()
         if pool > 1:
             h = torch.nn.functional.avg_pool1d(h.transpose(1, 2), pool).transpose(1, 2)
-        out.append(h.cpu().numpy().astype(np.float32))
-    return np.concatenate(out)
+        out.append(h.cpu())
+    return torch.cat(out)
 
 
-# ------------------------------------------------------------------ PROVISIONAL TMR selection
-def choose_rank(lam, N, rule='var95'):
-    """Stand-in for the paper's Eq. 12.
-    'var95'   : smallest M explaining >= 95% of tr(C)
-    'ppca_bic': probabilistic-PCA BIC with N samples (penalises T*M parameters)."""
-    lam = np.clip(lam, 1e-12, None)
-    T = len(lam)
-    if rule == 'var95':
-        return int(np.searchsorted(np.cumsum(lam) / lam.sum(), 0.95) + 1)
-    best, best_m = np.inf, 1
-    for m in range(1, T):
-        sigma2 = lam[m:].mean()
-        nll = N * (np.log(lam[:m]).sum() + (T - m) * np.log(sigma2))
-        k = T * m - m * (m - 1) / 2 + m + 1
-        crit = nll + k * np.log(N)
-        if crit < best:
-            best, best_m = crit, m
-    return best_m
+@torch.no_grad()
+def dance_latents(model, motion_codes, pool=1, batch_size=64):
+    """(N, T, 128) the motion tokenizer's latents of the clips (quantizer.decode of their motion codes)."""
+    q = model.motion_vqvae.quantizer
+    dev = next(model.motion_vqvae.parameters()).device
+    out = []
+    for i in range(0, len(motion_codes), batch_size):
+        z = q.decode(motion_codes[i:i + batch_size].to(dev)).float()  # (B, 128, T)
+        if pool > 1:
+            z = torch.nn.functional.avg_pool1d(z, pool)
+        out.append(z.transpose(1, 2).cpu())
+    return torch.cat(out)
 
 
-def nn_omp(Z, y, k, ridge=1e-3):
-    """Non-negative OMP: add the atom (row of Z) most positively correlated with the residual,
-    refit non-negative ridge weights on the support, repeat. Returns support indices and weights."""
-    from scipy.optimize import nnls
-    S, w = [], np.zeros(0)
-    r = y.copy()
-    for _ in range(k):
-        corr = Z @ r
-        if S:
-            corr[S] = -np.inf
-        j = int(np.argmax(corr))
-        if corr[j] <= 0:
-            break
-        S.append(j)
-        ZS = Z[S]
-        Q = ZS @ ZS.T + ridge * np.eye(len(S))
-        L = np.linalg.cholesky(Q)
-        w, _ = nnls(L.T, np.linalg.solve(L, ZS @ y))
-        r = y - ZS.T @ w
-    return np.array(S), w
+# ---------------------------------------------------------------- selection (DiscoForcing build_replay_buffer.py)
+def select_random(N, budget, rng, **_):
+    return sorted(rng.choice(N, budget, replace=False).tolist()), None, None
 
 
-def tmr_select(phi, budget, solver='omp', rank=None, rank_rule='var95', ridge=1e-3):
+def temporal_operator_masked(phi, mask, chunk=64):
+    """C = 1/(N D) sum_i phi~_i phi~_i^T (T x T) for zero-padded clips: every entry (t, s) is averaged over the clips
+    valid at both t and s. Same computation as DiscoForcing's, accumulated over chunks of clips to bound memory."""
+    m = mask.double()
+    D = phi.shape[2]
+    bar = torch.zeros(phi.shape[1], D, dtype=torch.float64)
+    for s in range(0, len(phi), chunk):
+        bar += (phi[s:s + chunk].double() * m[s:s + chunk, :, None]).sum(0)
+    bar /= m.sum(0).clamp(min=1)[:, None]
+    C = torch.zeros(phi.shape[1], phi.shape[1], dtype=torch.float64)
+    for s in range(0, len(phi), chunk):
+        tilde = (phi[s:s + chunk].double() - bar) * m[s:s + chunk, :, None]
+        C += torch.einsum("ntd,nsd->ts", tilde, tilde)
+    return C / ((m.T @ m).clamp(min=1) * D)
+
+
+def select_tmr(temporal, mask, budget, rng, stop="fw", **_):
+    """TMR, paper Algorithm 1 (OMP variant): temporal operator of the uncentred trajectories phi_i, rank M by the PPCA
+    BIC (n_eff = N D), whitened modal atoms gamma_i = Lambda^{-1/2} V^T phi_i, simplex-constrained OMP towards the
+    mean atom; it stops early when no atom lowers the modal error (stop='fw')."""
+    phi = (temporal * mask[..., None]).float()
     N, T, D = phi.shape
-    X = phi - phi.mean(0, keepdims=True)                                             # centred trajectories
-    C = np.zeros((T, T), dtype=np.float64)
-    for i in range(0, N, 256):
-        xb = X[i:i + 256].astype(np.float64)
-        C += np.einsum('ntd,nsd->ts', xb, xb)
-    C /= N * D                                                                        # temporal feature operator
-    lam, U = np.linalg.eigh(C)
-    lam, U = lam[::-1], U[:, ::-1]
-    M = rank or choose_rank(lam, N, rank_rule)
-    Um = np.ascontiguousarray(U[:, :M]).astype(np.float32)
-    gamma = np.einsum('tm,ntd->nmd', Um, X) / np.sqrt(np.clip(lam[:M], 1e-12, None)).astype(np.float32)[None, :, None]
-    Z = gamma.reshape(N, -1)
-    Z /= np.linalg.norm(Z, axis=1, keepdims=True) + 1e-12                              # unit-norm z_i
-    y = Z.sum(0)
-    assert solver == 'omp', 'provisional code implements OMP only; CoSaMP / SSP come with your implementation'
-    S, w = nn_omp(Z, y, budget, ridge)
-    keep = w > 0
-    S, w = S[keep], w[keep]
-    w = w * len(w) / w.sum()                                                          # mean-one weights
-    return S, w, {'rank': int(M), 'eigvals': lam[:64].copy(), 'explained': float(lam[:M].sum() / lam.sum())}
+    lam_, U = tmr_select.eig_desc(temporal_operator_masked(phi, mask).numpy())
+    Z, info = tmr_select.modal_dictionary(phi.numpy(), "temporal", ops={"lam": lam_, "U": U})
+    idx, w, hist = tmr_select.omp_simplex(Z, budget, stop=stop, trace=True)
+    M = info["M"]
+    print(f"[tmr] T={T} D={D}: M={M} modes by PPCA BIC ({lam_[:M].sum() / lam_.sum():.1%} of temporal variance); "
+          f"OMP picked {len(idx)}/{budget} clips, modal error {hist[0]:.3f} -> {hist[-1]:.3f}")
+    if len(idx) < budget:
+        print(f"[tmr] stopped early: no further clip lowers the modal error (Algorithm 1); buffer has {len(idx)} clips")
+    return idx.tolist(), (np.asarray(w) * len(idx)).tolist(), None, {"M": M, "T": T, "D": D, "modal_error": hist}
 
 
-# ------------------------------------------------------------------ commands
+def balanced_blocks(blocks, mask):
+    """Concatenate trajectory blocks (N, T, D_b) along channels, each scaled to unit mean squared deviation per valid
+    token so every block carries the same weight in the temporal operator."""
+    m = mask.float()
+    out = []
+    for g in blocks:
+        g = g.float()
+        bar = (g * m[..., None]).sum(0) / m.sum(0).clamp(min=1)[:, None]
+        dev = (((g - bar) ** 2).sum(-1) * m).sum() / m.sum().clamp(min=1)
+        out.append(g / dev.sqrt().clamp(min=1e-12))
+    return torch.cat(out, -1) * m[..., None]
+
+
+def channel_covariance(phi, mask, chunk=64):
+    """torch.cov of every valid (clip, time) row of phi (D x D), accumulated over chunks of clips."""
+    D = phi.shape[2]
+    s1, s2, n = torch.zeros(D, dtype=torch.float64), torch.zeros(D, D, dtype=torch.float64), 0
+    for s in range(0, len(phi), chunk):
+        x = phi[s:s + chunk][mask[s:s + chunk].bool()].double()
+        s1 += x.sum(0)
+        s2 += x.T @ x
+        n += len(x)
+    mu = s1 / n
+    return (s2 - n * torch.outer(mu, mu)) / (n - 1)
+
+
+def effective_samples(Cc, N, cond_groups=None, n_cond=0):
+    """Satterthwaite effective number of independent temporal vectors among the N x D channel trajectories that the
+    temporal operator averages: n_eff = (tr K)^2 / ||K||_F^2, K their correlation (DiscoForcing; only logged for
+    tmr_joint, whose rank uses N x D). Returns (n_eff, #ordered same-condition pairs of distinct clips)."""
+    tr2, f = float(torch.trace(Cc)) ** 2, float((Cc ** 2).sum())
+    pairs = 0.0
+    if cond_groups is not None and n_cond > 0:
+        _, n_g = np.unique(np.asarray(cond_groups), return_counts=True)
+        pairs = float((n_g * (n_g - 1)).sum())
+    f_c = float((Cc[:n_cond, :n_cond] ** 2).sum()) if pairs else 0.0
+    return N * tr2 / (f + pairs / N * f_c), pairs
+
+
+def condition_groups(temporal, mask, eps, device="cpu"):
+    """Clips whose music trajectories coincide within eps (relative to the mean trajectory norm), with the largest
+    distance within and the smallest between groups (DiscoForcing condition_groups + condition_gap, one distance
+    matrix for both)."""
+    flat = (temporal * mask[..., None]).reshape(len(temporal), -1).to(device, torch.float32)
+    d = (torch.cdist(flat, flat) / flat.norm(dim=1).mean().clamp(min=1e-12)).double().cpu()
+    del flat
+    parent = list(range(len(d)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    ii, jj = torch.nonzero(torch.triu(d < eps, 1), as_tuple=True)
+    for i, j in zip(ii.tolist(), jj.tolist()):
+        parent[find(i)] = find(j)
+    gid = [find(i) for i in range(len(d))]
+    g = torch.tensor(gid)
+    same = (g[:, None] == g[None]) & ~torch.eye(len(g), dtype=torch.bool)
+    within = float(d[same].max()) if same.any() else 0.0
+    between = float(d[g[:, None] != g[None]].min()) if (g[:, None] != g[None]).any() else float("inf")
+    return gid, within, between
+
+
+def select_tmr_dance(blocks, mask, groups, budget, rng, per_dance=1, rank="energy", energy=0.9, weights="uniform",
+                     stop="fw", label="tmr_dance", cond_groups=None, fill="kcenter", **_):
+    """DiscoForcing select_tmr_dance (the function behind tmr_joint) with moments=1: TMR core on balanced trajectory
+    blocks, at most `per_dance` clips per song (0 = no limit), k-center fill to the budget if OMP stops early.
+    rank: energy | bic_clips | bic_dims (N_eff = #clips x channels, tmr_joint) | bic_ess | bic_neff."""
+    phi = balanced_blocks(blocks, mask)
+    N, T, D = phi.shape
+    lam_, U = tmr_select.eig_desc(temporal_operator_masked(phi, mask).numpy())
+    Cc = channel_covariance(phi, mask)
+    d_eff = float(torch.trace(Cc) ** 2 / (Cc ** 2).sum())
+    n_eff, pairs = effective_samples(Cc, N, cond_groups, blocks[0].shape[-1])
+    M_clips, M_dims = tmr_select.bic_rank(lam_, N)[0], tmr_select.bic_rank(lam_, N * D)[0]
+    M_ess, M_neff = tmr_select.bic_rank(lam_, N * d_eff)[0], tmr_select.bic_rank(lam_, n_eff)[0]
+    M_energy = int(np.searchsorted(np.cumsum(lam_) / lam_.sum(), energy) + 1)
+    M = {"energy": M_energy, "bic_clips": M_clips, "bic_dims": M_dims, "bic_ess": M_ess, "bic_neff": M_neff}[rank]
+    Z, _ = tmr_select.modal_dictionary(phi.numpy(), "temporal", ops={"lam": lam_, "U": U}, M=M)
+    del phi
+    groups = np.asarray(groups)
+    quotas = {int(g): per_dance for g in np.unique(groups)} if per_dance > 0 else None
+    idx, w, hist = tmr_select.omp_simplex(Z, budget, groups if quotas else None, quotas, stop=stop, trace=True)
+    n_omp = len(idx)
+    if n_omp < budget and fill == "pursuit":  # the same objective at a fixed budget: the first n_omp picks are unchanged
+        idx, w, hist = tmr_select.omp_simplex(Z, budget, groups if quotas else None, quotas, stop="none", trace=True)
+    idx = [int(i) for i in idx]
+    modal_w = dict(zip(idx, (np.asarray(w) * max(len(idx), 1)).tolist()))
+    # modal and operator errors of the buffer (DiscoForcing computes them on [Z / sqrt(D), vech(S_i) / sqrt(2)])
+    Gm = Z.reshape(N, M, D)
+    bar = Gm.mean(0, dtype=np.float64).astype(np.float32)
+    iu = np.triu_indices(M)
+    scale = (np.where(iu[0] == iu[1], 1.0, math.sqrt(2.0)) / math.sqrt(2.0)).astype(np.float32)
+    second = np.empty((N, len(iu[0])), np.float32)
+    for i in range(N):
+        g = Gm[i] - bar
+        second[i] = (g @ g.T / D)[iu] * scale
+    wv = np.asarray(w, np.float64)
+    eps_mod = np.linalg.norm(Z.mean(0, dtype=np.float64) - wv @ Z[idx].astype(np.float64))
+    eps_C = np.linalg.norm(second.mean(0, dtype=np.float64) - wv @ second[idx].astype(np.float64)) * math.sqrt(2.0)
+    del second, Gm
+    if len(idx) < budget:  # k-center fill: the clip farthest (in modal space) from the buffer, from an unused song
+        def dist(s, chunk=256):  # DiscoForcing's ||Zd - Zd[s]|| in float64, over chunks of rows to bound memory
+            zs = Z[s].astype(np.float64)
+            return np.concatenate([np.linalg.norm(Z[c:c + chunk].astype(np.float64) - zs, axis=1)
+                                   for c in range(0, N, chunk)])
+        dmin = np.full(N, np.inf)
+        for s in idx:
+            dmin = np.minimum(dmin, dist(s))
+        count = {}
+        for i in idx:
+            count[groups[i]] = count.get(groups[i], 0) + 1
+        while len(idx) < budget:
+            ok = np.array([i not in modal_w and (per_dance <= 0 or count.get(groups[i], 0) < per_dance) for i in range(N)])
+            if not ok.any():
+                break
+            j = int(np.argmax(np.where(ok, dmin if idx else 0.0, -np.inf)))
+            idx.append(j)
+            modal_w[j] = 0.0
+            count[groups[j]] = count.get(groups[j], 0) + 1
+            dmin = np.minimum(dmin, dist(j))
+    wts = [1.0] * len(idx) if weights == "uniform" else [max(modal_w[i], 1e-3) for i in idx]
+    s = sum(wts)
+    wts = [v / s * len(wts) for v in wts]
+    n_fill = len(idx) - n_omp
+    print(f"[{label}] T={T} channels={D} (blocks {[b.shape[-1] for b in blocks]}): M={M} modes by {rank} "
+          f"({energy:.0%} energy: {M_energy}, BIC N_eff=N: {M_clips}, BIC N_eff=N*D: {M_dims}, BIC N_eff=N*D_eff "
+          f"(D_eff={d_eff:.1f}): {M_ess}, BIC n_eff={n_eff:.0f} ({pairs:.0f} same-music pairs): {M_neff}; "
+          f"{lam_[:M].sum() / lam_.sum():.1%} of temporal variance); mean matched; OMP picked {n_omp}/{budget}"
+          + (f", {'k-center' if fill == 'kcenter' else 'pursuit'} fill {n_fill}" if n_fill else "")
+          + f"; objective {hist[0]:.3f} -> {hist[-1]:.3f}; modal error {eps_mod:.3f}, operator error {eps_C:.3f}; "
+          f"{len(set(groups[idx].tolist()))} songs; weights {weights} "
+          f"(effective size {sum(wts) ** 2 / sum(v * v for v in wts):.1f} of {len(wts)})")
+    score = torch.full((N,), float("nan"))
+    for i in idx:
+        score[i] = modal_w[i]  # each clip's "score": its OMP (simplex) weight, 0 for k-center fill
+    return idx, wts, score, {"M": M, "T": T, "D": D, "n_omp": n_omp, "n_fill": n_fill, "modal_error": eps_mod,
+                             "operator_error": eps_C, "objective": hist}
+
+
+# ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    sub = ap.add_subparsers(dest='cmd', required=True)
-    for name in ['random', 'tmr']:
-        p = sub.add_parser(name)
-        p.add_argument('--train_cache', required=True)
-        p.add_argument('--frac', type=float, default=0.10)
-        p.add_argument('--out', required=True)
-        p.add_argument('--seed', type=int, default=0)
-        if name == 'tmr':
-            p.add_argument('--lm_state', required=True, help='checkpoint of the session just finished')
-            p.add_argument('--ckpt', default='pretrained/full.ckpt')
-            p.add_argument('--layer', type=int, default=12)
-            p.add_argument('--pool', type=int, default=2)
-            p.add_argument('--rank', type=int, default=None, help='fix the rank M (overrides --rank_rule)')
-            p.add_argument('--rank_rule', choices=['var95', 'ppca_bic'], default='var95')
-            p.add_argument('--solver', default='omp')
-    m = sub.add_parser('merge')
-    m.add_argument('--inputs', nargs='+', required=True)
-    m.add_argument('--out', required=True)
-    args = ap.parse_args()
-    os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
-
-    if args.cmd == 'merge':
-        bufs = [torch.load(p) for p in args.inputs]
-        out = {'music_code': torch.cat([b['music_code'] for b in bufs]),
-               'motion_code': torch.cat([b['motion_code'] for b in bufs]),
-               'ids': sum([list(b['ids']) for b in bufs], []),
-               'weights': torch.cat([torch.as_tensor(b['weights'], dtype=torch.float) for b in bufs]),
-               'sources': args.inputs}
-        torch.save(out, args.out)
-        print(f'merged {[len(b["ids"]) for b in bufs]} -> {len(out["ids"])} windows: {args.out}')
-        return
-
-    cache = torch.load(args.train_cache)
-    N = cache['music_code'].shape[0]
-    budget = max(1, int(round(args.frac * N)))
+    ap.add_argument('--method', required=True, choices=['random', 'tmr', 'tmr_joint'])
+    ap.add_argument('--session', type=int, required=True, help='session whose buffer is built (1, 2, ...)')
+    ap.add_argument('--manifest', required=True, help="that session's training manifest (cl/finedance_sessions.py)")
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--lm_state', default=None, help='LM after this session (needed for tmr / tmr_joint)')
+    ap.add_argument('--ckpt', default='pretrained/full.ckpt')
+    ap.add_argument('--window', type=float, default=5.0, help='clip length = the training window (seconds)')
+    ap.add_argument('--cand_cache', default=None, help='default outputs/token_cache/<s>_cand_w<window>.pt')
+    ap.add_argument('--ratio', type=float, default=0.10, help="buffer size as a fraction of the session's clips")
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--tmr_stop', choices=['fw', 'positive'], default='fw', help='OMP stopping rule (tmr_select)')
+    ap.add_argument('--mix_eps', type=float, default=0.02, help='tmr_joint log: music windows closer than this are one')
+    ap.add_argument('--music_layer', type=int, default=0, help='0 = the LM music input embedding (DiscoForcing analogue)')
+    ap.add_argument('--pool', type=int, default=1, help='average-pool trajectories in time (1 = the 50 Hz token rate)')
+    a = ap.parse_args()
     t0 = time.time()
-    if args.cmd == 'random':
-        idx = np.random.default_rng(args.seed).choice(N, budget, replace=False)
-        buf = subset(cache, np.sort(idx), extra={'method': 'random'})
+    rng = np.random.default_rng(a.seed * 1000 + a.session)
+    torch.manual_seed(a.seed)
+
+    model = None
+
+    def get_model():
+        nonlocal model
+        if model is None:
+            from unimumo.models import UniMuMo
+            model = UniMuMo.from_checkpoint(a.ckpt)
+            if a.lm_state:
+                load_lm_state(model, a.lm_state)
+            model.music_motion_lm.eval()
+        return model
+
+    cand_path = a.cand_cache or os.path.join('outputs/token_cache', f"{Path(a.manifest).stem.split('_')[0]}_cand_w{a.window:g}.pt")
+    cands = candidate_cache(get_model, a.manifest, a.window, cand_path)
+    N = len(cands['ids'])
+    budget = max(1, round(a.ratio * N))
+    print(f'session {a.session}: {N} candidate clips from {a.manifest}, budget {budget} ({a.ratio:.0%})')
+
+    info = {}
+    if a.method == 'random':
+        idx, wts, score = select_random(N, budget, rng)
     else:
-        from unimumo.models import UniMuMo
-        from eval_nll import load_lm_state
-        model = UniMuMo.from_checkpoint(args.ckpt)
-        load_lm_state(model, args.lm_state)
-        phi = audio_trajectories(model.music_motion_lm, cache['music_code'], args.layer, args.pool)
-        print(f'phi: {phi.shape} (windows, frames, dims) from layer {args.layer} in {time.time() - t0:.0f}s')
-        del model
-        torch.cuda.empty_cache()
-        S, w, info = tmr_select(phi, budget, args.solver, args.rank, args.rank_rule)
-        print(f"rank M = {info['rank']} (explains {100 * info['explained']:.1f}% of trace); "
-              f"selected {len(S)} / budget {budget}; weights min {w.min():.2f} max {w.max():.2f}")
-        buf = subset(cache, S, w, extra={'method': f'tmr_provisional_{args.solver}', 'layer': args.layer, **info})
-    torch.save(buf, args.out)
-    print(f'{args.cmd}: {len(buf["ids"])} of {N} windows ({100 * len(buf["ids"]) / N:.1f}%) '
-          f'in {time.time() - t0:.0f}s -> {args.out}')
+        if not a.lm_state:
+            ap.error(f'--lm_state (the model after session {a.session}) is required for {a.method}')
+        m = get_model()
+        music = music_trajectories(m.music_motion_lm, cands['music_code'], a.music_layer, a.pool)
+        mask = torch.ones(music.shape[:2], dtype=torch.bool)
+        print(f'music trajectories {tuple(music.shape)} (layer {a.music_layer}, pool {a.pool}) ({time.time() - t0:.0f}s)')
+        if a.method == 'tmr':
+            idx, wts, score, info = select_tmr(music, mask, budget, rng, stop=a.tmr_stop)
+        else:
+            dance = dance_latents(m, cands['motion_code'], a.pool)
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            cond, within, between = condition_groups(music, mask, a.mix_eps, device)
+            print(f'[tmr_joint] music windows: {N} clips -> {len(set(cond))} distinct (same window: relative distance '
+                  f'<= {within:.2e}; different windows: >= {between:.3f}; eps {a.mix_eps})')
+            T = min(music.shape[1], dance.shape[1])
+            song_id = {n: i for i, n in enumerate(sorted(set(cands['songs'])))}
+            idx, wts, score, info = select_tmr_dance(
+                [music[:, :T], dance[:, :T]], mask[:, :T], [song_id[n] for n in cands['songs']], budget, rng,
+                per_dance=0, rank='bic_dims', weights='modal', stop=a.tmr_stop, label='tmr_joint', cond_groups=cond,
+                fill='kcenter')
+
+    wts = wts or [1.0] * len(idx)
+    it = torch.as_tensor(idx, dtype=torch.long)
+    buf = {'music_code': cands['music_code'][it].clone(), 'motion_code': cands['motion_code'][it].clone(),
+           'ids': [cands['ids'][i] for i in idx], 'songs': [cands['songs'][i] for i in idx],
+           'weights': torch.tensor(wts, dtype=torch.float), 'indices': it, 'session': a.session, 'method': a.method,
+           'window': a.window, 'ratio': a.ratio, 'n_candidates': N, 'budget': budget}
+    os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
+    torch.save(buf, a.out)
+    clips = [dict({'id': cands['ids'][i], 'weight': float(w)},
+                  **({'score': float(score[i])} if score is not None and not torch.isnan(score[i]) else {}))
+             for i, w in zip(idx, wts)]
+    meta = {'method': a.method, 'session': a.session, 'manifest': a.manifest, 'lm_state': a.lm_state,
+            'ratio': a.ratio, 'n_candidates': N, 'budget': budget, 'n_clips': len(idx),
+            'n_songs': len(set(buf['songs'])), 'music_layer': a.music_layer, 'pool': a.pool, 'seed': a.seed,
+            'tmr_stop': a.tmr_stop, 'info': {k: v for k, v in info.items() if k != 'objective'},
+            'seconds': round(time.time() - t0, 1), 'clips': clips}
+    json.dump(meta, open(os.path.splitext(a.out)[0] + '.json', 'w'), indent=1, default=float)
+    w = np.array(wts)
+    print(f'saved {a.out}: {len(idx)} clips from {len(set(buf["songs"]))} songs ({len(idx) / N:.1%} of the session); '
+          f'weights mean {w.mean():.3f} min {w.min():.3f} max {w.max():.3f}; {time.time() - t0:.0f} s')
 
 
 if __name__ == '__main__':
