@@ -69,7 +69,9 @@ else
         case $status in
           0) echo "[all] $m finished ($(date))" ;;
           3) echo "[all] $m is running in another process: left to it" ;;
-          *) echo "[all] $m FAILED with status $status ($(date)): tail logs/replay_$m.log" ;;
+          4) echo "[all] $m not started: $(tail -n 1 logs/replay_$m.log)" ;;
+          *) echo "[all] $m FAILED with status $status ($(date)); end of logs/replay_$m.log:"
+             tail -n 30 logs/replay_$m.log | sed 's/^/    /' ;;
         esac
       done
     ) &

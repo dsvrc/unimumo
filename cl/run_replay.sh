@@ -58,11 +58,21 @@ NAME=(- s1_street s2_folk s3_classic)
 TESTS="--manifest s1_test=$M/s1_street_test.jsonl --manifest s2_test=$M/s2_folk_test.jsonl --manifest s3_test=$M/s3_classic_test.jsonl"
 
 run() {  # run <output> <log> <command ...> : run the command unless <output> already exists
-  local out=$1 log=$2; shift 2
+  local out=$1 log=$2 t0=$SECONDS status; shift 2
   if [ -e "$out" ]; then echo "      skipped, $out exists"; return 0; fi
   if [ "$DRY" = 1 ]; then echo "      would run: $* > $log"; return 0; fi
-  "$@" > "$log" 2>&1
+  "$@" > "$log" 2>&1 && return 0
+  status=$?
+  echo "      FAILED after $(( (SECONDS - t0) / 60 )) min ($(date)): $*"
+  if [ $status -gt 128 ]; then
+    echo "      killed by signal $((status - 128)) ($(kill -l $((status - 128)) 2>/dev/null)) from outside this script: a job" \
+         "time limit, the node's limit on long processes, or a manual kill; the same command resumes at this step"
+  fi
+  echo "      last lines of $log:"
+  tail -n 25 "$log" | sed 's/^/        /'
+  exit 1
 }
+trap 'echo "[$METHOD] stopped by SIGTERM on $(hostname) ($(date)): a job time limit, the node, or a manual kill"; exit 143' TERM
 model_dir() { if [ "$1" -eq 1 ]; then echo $R/s1; else echo $R/$METHOD/s$1; fi; }
 [ -f $R/s1/lm.pt ] || { echo "no S1 model at $R/s1/lm.pt: run cl/run_vanilla.sh first"; exit 1; }
 [ -f $E/noise.json ] || { echo "no dance-metric references at $E: run cl/run_eval_dance.sh first"; exit 1; }
@@ -71,6 +81,16 @@ if [ "$DRY" != 1 ] && command -v flock > /dev/null 2>&1; then  # one process per
   flock -n 9 || { echo "[$METHOD] already running in another process (lock logs/.lock_replay_$METHOD): not started"; exit 3; }
 fi
 echo "[$METHOD] stage $STAGE, selection ${SELECT:-none}, training ${TRAIN:-ground-truth replay}, balance $BALANCE ($(date))"
+if [ "$DRY" != 1 ]; then  # every step runs on the GPU: stop early, and say where, when this shell sees none
+  if ! python -c "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)" > /dev/null 2>&1; then
+    echo "[$METHOD] no GPU visible on $(hostname) (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}): not started"
+    exit 4
+  fi
+  if command -v nvidia-smi > /dev/null 2>&1; then  # memory already in use shows a job sharing the GPU
+    nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader 2>/dev/null \
+      | sed "s/^/      $(hostname) GPU /" || true
+  fi
+fi
 
 for k in 2 3; do
   j=$((k - 1))
