@@ -2,20 +2,25 @@
 # Every method of the paper's DiscoForcing table on UniMuMo / FineDance (S1 Street -> S2 Folk -> S3 Classic), after
 # cl/run_vanilla.sh (the shared S1 model) and cl/run_eval_dance.sh (the dance-metric references): one
 # cl/run_replay.sh chain per method (buffers, S2 and S3 training, held-out loss and dance metrics). A method whose S3
-# is already scored is skipped; a half-finished one resumes at its first missing step.
+# is already scored is skipped; a half-finished one resumes at its first missing step; one that is running in another
+# process is left to it.
 #
 #   bash cl/run_all_methods.sh > logs/run_all.log 2>&1 &                    methods one after another
 #   GPUS="0 1 2 3" bash cl/run_all_methods.sh > logs/run_all.log 2>&1 &     one queue per GPU
 #
 # Paper name = method: Fine-tuning = vanilla, ER = random, STAR = random_star (ER + STAR), OCS = ocs, GCR = gcr,
-# MIR = mir, CSReL = csrel, TMR = tmr_joint_neff, ER+KD = random_kd, GCR+KD = gcr_kd, TMR+KD = tmr_joint_neff_kd;
-# also tmr and tmr_joint (TMR on music only, and the joint trajectory with the BIC's N x D).
-# env: METHODS (default: all of the above, in this order), GPUS (CUDA device ids, as CUDA_VISIBLE_DEVICES takes them;
-#      unset = one queue on the GPU(s) this shell already sees), and cl/run_replay.sh's BALANCE, RATIO, SAMPLES, ENCODER.
+# MIR = mir, CSReL = csrel, TMR = tmr_joint_neff, ER+KD = random_kd, GCR+KD = gcr_kd, MIR+KD = mir_kd,
+# CSReL+KD = csrel_kd, TMR+KD = tmr_joint_neff_kd; also tmr and tmr_joint (TMR on music only, and the joint
+# trajectory with the BIC's N x D).
+# env: METHODS (default: all of the above, in this order), REPORT_ORDER (rows of the final comparison; default
+#      METHODS), GPUS (CUDA device ids, as CUDA_VISIBLE_DEVICES takes them; unset = one queue on the GPU(s) this shell
+#      already sees), STAGE (all | train | test, passed to cl/run_replay.sh) and cl/run_replay.sh's BALANCE, RATIO,
+#      SAMPLES, ENCODER, BUFFER_ARGS.
 # Logs: logs/replay_<method>.log per method (and the step logs it names). At the end: the comparison of every
 # finished method; the full report is in outputs/dance_eval/report_replay.txt.
 set -uo pipefail
-METHODS=${METHODS:-"vanilla random random_star ocs gcr mir csrel tmr tmr_joint tmr_joint_neff random_kd gcr_kd tmr_joint_neff_kd"}
+METHODS=${METHODS:-"vanilla random random_star ocs gcr mir csrel tmr tmr_joint tmr_joint_neff random_kd gcr_kd mir_kd csrel_kd tmr_joint_neff_kd"}
+REPORT_ORDER=${REPORT_ORDER:-$METHODS}
 E=outputs/dance_eval
 N=outputs/nll
 HERE=$(dirname "$0")
@@ -60,11 +65,16 @@ else
         else
           REPORT=0 bash "$HERE/run_replay.sh" $m > logs/replay_$m.log 2>&1
         fi
-        if [ $? -eq 0 ]; then echo "[all] $m finished ($(date))"; else echo "[all] $m FAILED ($(date)): tail logs/replay_$m.log"; fi
+        status=$?
+        case $status in
+          0) echo "[all] $m finished ($(date))" ;;
+          3) echo "[all] $m is running in another process: left to it" ;;
+          *) echo "[all] $m FAILED with status $status ($(date)): tail logs/replay_$m.log" ;;
+        esac
       done
     ) &
   done
   wait
 fi
 for m in $METHODS; do finished $m || echo "[all] $m has not finished S3"; done
-COMPARE_ONLY=1 ORDER="$METHODS" bash "$HERE/report_replay.sh"
+COMPARE_ONLY=1 ORDER="$REPORT_ORDER" bash "$HERE/report_replay.sh"
